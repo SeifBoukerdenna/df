@@ -1,17 +1,48 @@
 {
-  "name": "df",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "polymarket-quant",
+  "version": "0.1.0",
+  "description": "Profit-maximizing quant research and execution platform for Polymarket prediction markets",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc --project tsconfig.json",
+    "start": "node dist/main.js",
+    "start:paper": "NODE_ENV=paper node dist/main.js",
+    "start:prod": "NODE_ENV=production node dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "dev:paper": "NODE_ENV=paper tsx watch src/main.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "ethers": "^6.13.4",
+    "pino": "^9.5.0",
+    "simple-statistics": "^7.8.8",
+    "undici": "^6.21.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@vitest/coverage-v8": "^2.1.8",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
   },
   "repository": {
     "type": "git",
     "url": "git@github-money:SeifBoukerdenna/df.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs"
+  "license": "ISC"
 }
