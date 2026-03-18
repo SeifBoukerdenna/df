@@ -1,0 +1,55 @@
+{
+  "paper_mode": false,
+
+  "ingestion": {
+    "book_poll_interval_ms": 1000,
+    "health_check_interval_ms": 15000
+  },
+
+  "logging": {
+    "level": "info",
+    "pretty": false
+  },
+
+  "strategies": {
+    "wallet_follow": {
+      "paper_only": false,
+      "capital_allocation": 0.25
+    },
+    "complement_arb": {
+      "paper_only": false,
+      "capital_allocation": 0.30
+    },
+    "book_imbalance": {
+      "paper_only": false,
+      "capital_allocation": 0.15
+    },
+    "large_trade_reaction": {
+      "paper_only": false,
+      "capital_allocation": 0.10
+    },
+    "stale_book": {
+      "paper_only": false,
+      "capital_allocation": 0.10
+    },
+    "cross_market_consistency": {
+      "paper_only": false,
+      "capital_allocation": 0.05
+    },
+    "microprice_dislocation": {
+      "paper_only": false,
+      "capital_allocation": 0.05
+    }
+  },
+
+  "risk": {
+    "max_position_pct": 0.08,
+    "max_total_exposure_pct": 0.70,
+    "max_daily_loss_pct": 0.04,
+    "max_drawdown_pct": 0.12,
+    "max_single_trade_loss_pct": 0.015,
+    "max_correlated_exposure_pct": 0.20,
+    "max_strategy_concentration_pct": 0.35,
+    "max_single_event_exposure_pct": 0.15
+  }
+}

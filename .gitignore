@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment — never commit secrets
+.env
+.env.*
+!.env.example
+
+# Ledger data — JSONL and JSON files are runtime artifacts, not source
+data/ledger/*.jsonl
+data/ledger/*.json
+data/raw_events/*.jsonl
+data/raw_events/*.json
+data/snapshots/*.json
+data/research/*.json
+data/features/*.jsonl
+data/features/*.json
+data/analysis/*.json
+data/analysis/*.jsonl
+
+# Checksums (generated at rotation time)
+*.sha256
+
+# But preserve the directory structure
+!data/**/.gitkeep
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+.idea/
+
+# Logs (pino writes to stdout; if redirected to file, ignore)
+*.log
+logs/
+
+# Test coverage
+coverage/
+.nyc_output/
