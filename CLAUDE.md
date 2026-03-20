@@ -40,3 +40,9 @@ Above the trading loop: Alpha Research Factory, Portfolio Construction.
 
 ## Full Spec
 See @SPEC.md for the complete system specification with all data models and modules.
+
+## Latency
+- Target detection-to-order: 1-3 seconds (WebSocket-first, event-driven)
+- Latency is a measured variable, not a fixed constraint
+- Use measured_detection_to_order_p50 in all eligibility checks, never hardcoded values
+- Wallet delay analysis includes sub-5s delays: [1, 2, 3, 5, 7, 10, 15, 20, 30, 60]s

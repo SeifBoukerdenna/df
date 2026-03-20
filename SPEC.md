@@ -10,7 +10,9 @@ You are a principal systems engineer and quantitative researcher building a **pr
 - Every decision the system makes must be traceable to an expected-value calculation with confidence intervals.
 - Every trade must be replayable from the ledger.
 - Assume adversarial conditions: latency spikes, stale data, disappearing liquidity, front-running, regime changes, alpha decay.
+- Aggressively reduce avoidable latency wherever it improves expected value. The system uses WebSocket-first ingestion, event-driven state updates, and a tight execution path. Target detection-to-order latency: 1–3 seconds. Latency is not a fixed constraint — it is a variable to continuously optimize.
 - The system's purpose is **continuous edge discovery, rigorous validation, optimal capital allocation, and disciplined exploitation.**
+- Continuously distinguish between three quantities: theoretical edge (does the signal predict correctly?), delayed edge (does the signal survive our execution latency?), and captured edge (what did we actually make after all frictions?). Only captured edge matters.
 - The system must treat its own strategies with the same skepticism it applies to market prices. Observed profits are suspect until proven statistically significant, robust to parameter perturbation, and decomposed into explainable components.
 - The system must be able to answer, at any moment: "Why are we making money, and will it continue?" If it cannot answer this, it must reduce exposure.
 
@@ -377,13 +379,13 @@ interface KillCondition {
 1. Maintain a rolling performance model per tracked wallet.
 2. For each wallet trade observed at time T0:
    - Estimate the wallet's historical edge at the observed price.
-   - Simulate what happens if we enter at T0 + Δ (where Δ = our realistic latency, 10–30s).
+   - Simulate what happens if we enter at T0 + Δ (where Δ = our measured detection-to-fill latency, target 1–3s).
    - Compute: `EV_delayed = wallet_edge - price_impact(Δ) - spread_cost - fees`
    - Only emit signal if `EV_delayed > threshold` (default 0.02 = 2 cents per share).
 3. Use wallet classification:
-   - **Snipers** (hold < 5 min): DO NOT FOLLOW — edge is destroyed by our latency.
-   - **Swing** (hold > 1 hour): FOLLOW if historically profitable after 30s delay.
-   - **Arbitrageurs**: DO NOT FOLLOW — they extract the entire edge instantly.
+   - **Snipers** (hold < 5 min): FOLLOW ONLY IF their edge halflife > our latency. At sub-5s execution, many snipers become followable that were previously inaccessible. Check the wallet's delay curve — if delayed PnL at our latency is still significantly positive, follow.
+   - **Swing** (hold > 1 hour): FOLLOW if historically profitable after our measured delay.
+   - **Arbitrageurs**: FOLLOW ONLY IF their edge persists beyond our latency. Some arbitrage strategies have edge that decays over seconds, not milliseconds. Check the delay curve.
    - **Market makers**: REVERSE SIGNAL — fade their inventory rebalancing.
 4. Adaptive threshold: if wallet's delayed-PnL is declining over last 20 trades, stop following.
 5. Regime-conditional: only follow wallets whose edge is positive in the CURRENT regime.
@@ -411,7 +413,7 @@ For each market:
 - If one leg fills and the other doesn't → you have directional exposure, not arb.
 - Track: `arb_opportunities_detected`, `arb_opportunities_executed`, `arb_leg_slip_rate`, `arb_realized_pnl`.
 - Compute: `expected_leg_slip_probability` per market based on historical book volatility. If P(second_leg_slip) > 0.1, reduce size or skip.
-- Monitor: `arb_gap_persistence_ms` — how long does a gap persist? If gaps close in <5s, we cannot capture them. Track this.
+- Monitor: `arb_gap_persistence_ms` — how long does a gap persist? Track the full distribution. At sub-3s execution latency, even short-lived gaps become capturable. Gaps that persist < 1s are likely uncapturable; gaps that persist 2–10s are the primary target; gaps > 30s may indicate structural mispricing worth larger size.
 
 ### STRATEGY 3: Book Imbalance Mean Reversion
 
@@ -481,6 +483,45 @@ When microprice diverges significantly from mid-price:
   - Enter in the direction microprice suggests the mid should move.
   - Exit when mid converges to microprice or time limit.
 - This is a very short-term strategy. Only viable in liquid markets with tight spreads.
+- At sub-3s execution latency, this becomes significantly more viable — the convergence window is typically 5–30 seconds.
+
+### STRATEGY 9: Information Cascade Detection
+
+When multiple wallets trade the same direction in rapid succession (3+ wallets within 60 seconds, same market, same direction) without an obvious external catalyst:
+- This may be an information cascade (herding) rather than genuine information.
+- Cascades typically overshoot fair value and revert.
+- Build a cascade detector: track wallet trade clustering per market per minute.
+- If cascade_probability > threshold (calibrated from historical cascade events):
+  - FADE the cascade direction after the initial burst subsides (wait for trade rate to decline from peak).
+  - Exit on partial reversion or time limit (5–15 minutes).
+- Requires: per-market calibration of cascade frequency, overshoot magnitude, and reversion speed.
+- Key distinction: genuine information events also look like cascades initially. Filter by: (a) absence of external news/event, (b) cascade driven by wallets with low individual profitability, (c) trade sizes are uniform (herding) vs varied (genuine).
+
+### STRATEGY 10: New Market Listing Mispricing
+
+Monitor for new market creation events. Newly listed markets are systematically mispriced because:
+- Liquidity providers haven't arrived yet.
+- Initial prices are set by a small number of participants.
+- Consistency with related existing markets has not been enforced by arbitrageurs.
+- When a new market appears:
+  1. Immediately run consistency checks against all related markets in the MarketGraph.
+  2. If the new market's implied probability violates a structural bound (e.g., inconsistent with an existing partition), trade toward consistency.
+  3. If no structural bound exists, compare against the event cluster's consensus pricing.
+- Edge decays rapidly as other participants arrive — signals from this strategy have very short halflife (minutes to low single-digit hours).
+- Track: new_market_mispricing_frequency, avg_mispricing_magnitude, time_to_correction.
+
+### STRATEGY 11: Resolution Convergence
+
+As markets approach resolution:
+- Markets where the outcome is becoming clear (price > 0.90 or < 0.10) often converge too slowly.
+- Participants holding the losing side sell at suboptimal prices as certainty increases — the "resolution rush."
+- Build a convergence speed model per market category:
+  - Sports markets converge fastest (result is instantly verifiable).
+  - Political/event markets converge slower (result announcement has uncertainty).
+  - Track: for resolved markets, what was the price path from P=0.85 to resolution? How long? How much value was left on the table?
+- When price is 0.85–0.95 and convergence is slower than the model predicts for this category: buy.
+- When price is 0.05–0.15 and convergence is slow: sell (buy NO).
+- Risk: resolution outcome is uncertain until actual resolution. Only trade when the information is very strong (price > 0.90).
 
 ### Strategy Selection & Portfolio
 
@@ -650,11 +691,14 @@ interface ExecutionRecord {
 
 | Stage | Target | Alert Threshold |
 |---|---|---|
-| Signal → Execution plan | < 100ms | > 500ms |
-| Execution plan → Order submission | < 400ms | > 2s |
-| Order submission → ACK | < 1s | > 5s |
-| ACK → First fill | < 5s (limit) | > 30s |
-| End-to-end (signal → final fill) | < 10s | > 30s |
+| Signal → Execution plan | < 50ms | > 200ms |
+| Execution plan → Order submission | < 200ms | > 1s |
+| Order submission → ACK | < 500ms | > 3s |
+| ACK → First fill | < 3s (limit) | > 15s |
+| End-to-end (signal → final fill) | < 5s | > 15s |
+| Detection-to-order (WebSocket event → order submitted) | < 1s | > 3s |
+
+Note: The detection-to-order metric is the most critical. It measures the time from when a triggering event (wallet trade, book change, consistency violation) is ingested to when our response order hits the exchange. This is the latency that determines which strategies are viable. Continuously measure and optimize this path.
 
 ### Requirements
 - Idempotent order submission (dedup by signal_id).
@@ -818,7 +862,7 @@ For each tracked wallet:
 
 For each wallet, for each historical trade:
 ```
-for delay in [5, 10, 15, 20, 30, 60, 120, 300] seconds:
+for delay in [1, 2, 3, 5, 7, 10, 15, 20, 30, 60] seconds:
   simulated_entry = price_at(trade.timestamp + delay)
   simulated_exit = actual_exit_price (same exit timing)
   delayed_pnl = (simulated_exit - simulated_entry) * trade.size - fees
@@ -829,6 +873,7 @@ Compute:
   - t-statistic: is delayed_pnl significantly > 0?
   - optimal_delay: which delay maximizes risk-adjusted return?
   - delay_sensitivity: how fast does PnL degrade with delay?
+  - edge_halflife: at what delay does PnL decay to 50% of zero-delay PnL?
 ```
 
 Output: `wallet_delay_curve[wallet][delay] → { mean_pnl, ci_low, ci_high, t_stat, n_trades }`
@@ -1117,6 +1162,9 @@ polymarket-quant/
 │   │   ├── stale_book.ts
 │   │   ├── cross_market_consistency.ts
 │   │   ├── microprice_dislocation.ts
+│   │   ├── cascade_detection.ts
+│   │   ├── new_market_listing.ts
+│   │   ├── resolution_convergence.ts
 │   │   └── types.ts
 │   ├── portfolio/
 │   │   ├── portfolio_constructor.ts
@@ -2053,7 +2101,7 @@ A retail builder takes every positive-EV trade. A quant firm computes opportunit
 
 ## IMPLEMENTATION ORDER
 
-Build in this exact sequence. Each phase must be testable before moving to the next.
+Build in this exact sequence. Each phase must be testable before moving to the next. Note: The intelligence layer (Phase 2) starts data collection pipelines that run continuously in the background while subsequent phases are built. Every day of data collection before strategy validation makes the research factory more powerful.
 
 ### Phase 1: Foundation (Days 1–3)
 1. Project scaffolding (file structure, config, logging, CLI skeleton)
@@ -2063,75 +2111,58 @@ Build in this exact sequence. Each phase must be testable before moving to the n
 5. Ledger: Append-only JSONL writer with replay and checksums
 6. CLI: `quant report state`, `quant report health`
 
-### Phase 2: Wallet Intelligence (Days 4–6)
-1. Ingestion: Wallet transaction listener
-2. WalletState: Trade collection and stats computation with significance tests
-3. Wallet classifier with confidence scoring
-4. Delay profitability analysis with confidence intervals
-5. Wallet scorer
-6. CLI: `quant report wallets`
-
-### Phase 3: Market Structure (Days 7–9)
+### Phase 2: Intelligence Layer (Days 4–10)
+Start ALL data collection simultaneously — this data compounds in value.
 1. Market graph builder (semantic clustering, relationship detection)
-2. Consistency checker (exhaustive partition, subset/superset)
-3. Regime detector
-4. Stale-price propagation model
-5. Feature extraction engine (all features defined, stored as time series)
-6. CLI: `quant report consistency`, `quant report regime`
+2. Market classifier (type 1/2/3, efficiency score, EdgeMap)
+3. Consistency checker (exhaustive partition, subset/superset, conditional, temporal)
+4. Stale-price propagation model (continuous measurement)
+5. Wallet transaction listener (real-time, WebSocket-based)
+6. Wallet classifier with delay analysis at sub-5s delays
+7. Wallet scorer with regime-conditional analysis
+8. Regime detector
+9. Feature extraction engine (all features, stored as time series)
+10. CLI: `quant report markets`, `quant report wallets`, `quant report consistency`, `quant report regime`
+11. START THE SYSTEM — let data collect continuously from this point
 
-### Phase 4: Research Factory Core (Days 10–13)
-1. Hypothesis registry
-2. Walk-forward validation framework
-3. Parameter sweep / ablation framework
-4. Significance testing pipeline
-5. Decay detector
-6. Experiment lifecycle (register → test → validate/reject → promote/retire)
-7. CLI: `quant report research`, `quant report sensitivity`
-
-### Phase 5: Strategy Engine + Shadow (Days 14–18)
-1. Strategy engine framework (signal generation → portfolio → execution routing)
-2. Implement Strategy 1 (Latency-Aware Wallet Follow) in shadow mode
-3. Implement Strategy 2 (Complement Arbitrage) in shadow mode
-4. Implement Strategy 7 (Cross-Market Consistency) in shadow mode
-5. Counterfactual engine with full attribution
+### Phase 3: Edge Discovery (Days 8–15, overlaps with Phase 2 data collection)
+1. Research framework: hypothesis registry with 12+ pre-registered hypotheses
+2. Strategy engine framework (signal generation, market eligibility, shadow mode)
+3. Strategies 1-7 implemented in shadow mode (wallet follow, complement arb, consistency arb, stale book, book imbalance, large trade reaction, microprice)
+4. Counterfactual engine with full signal/execution attribution
+5. Paper trading execution with realistic simulated fills
 6. CLI: `quant report counterfactual`, `quant report viability`, `quant report attribution`
+7. EVALUATION GATE: which strategies show positive edge_net with statistical significance?
 
-### Phase 6: Portfolio Construction (Days 19–22)
-1. Covariance estimator (cross-strategy, cross-market)
-2. Capital allocator (marginal Sharpe optimization)
-3. Exposure netter
-4. Portfolio-level drawdown controller
-5. Opportunity cost calculator
-6. CLI: `quant report portfolio`
+### Phase 4: Validation & Execution (Days 16–22)
+1. Walk-forward validation framework
+2. Parameter sweep with cliff detection, ablation
+3. Significance testing (7-point gate) with multiple testing correction
+4. Decay detector with automatic retirement
+5. Real execution engine with idempotent orders, fill monitoring, partial fill handling
+6. Risk manager with conservative initial limits + kill switches
+7. EVALUATION GATE: validated strategies pass significance gate, preflight checks pass
 
-### Phase 7: Execution Engine + Research (Days 23–27)
-1. Execution engine (order submission, fill tracking, reconciliation)
-2. Execution strategy selector (passive vs aggressive logic)
-3. Partial fill handler + cancel/repost logic
-4. Fill model (queue-aware)
-5. Execution quality attribution (separate from signal quality)
-6. Risk manager (all hard limits + dynamic sizing)
-7. Kill switches
-8. Paper trading mode (full pipeline with simulated fills)
-9. CLI: `quant report pnl`, `quant report positions`, `quant report execution-quality`
+### Phase 5: Go Live (Days 23–28)
+1. Deploy validated strategies at controlled size
+2. Collect real execution data for 5-7 days
+3. Build execution research layer from real data
+4. Optimize execution path based on real fill data
+5. EVALUATION GATE: is real PnL positive? Does it match paper PnL?
 
-### Phase 8: Advanced Strategies (Days 28–33)
-1. Strategy 3: Book Imbalance
-2. Strategy 4: Large Trade Reaction
-3. Strategy 5: Stale Book Exploitation
-4. Strategy 6: Resolution Convergence
-5. Strategy 8: Microprice Dislocation
-6. All in shadow mode first → promote based on research factory validation
+### Phase 6: Scale (Days 29–36)
+1. Portfolio construction: covariance estimation, capital allocation, exposure netting
+2. Progressive risk limit relaxation based on evidence
+3. Additional strategies (cascade detection, new market listing, resolution convergence)
+4. Automatic strategy lifecycle management (promote, retire, reallocate)
+5. EVALUATION GATE: portfolio-level Sharpe, diversification, capital efficiency
 
-### Phase 9: Production Hardening (Days 34–38)
-1. Full integration testing
-2. Crash recovery testing (kill process, restart, verify state)
-3. Latency optimization (profile and remove bottlenecks)
-4. Stress testing (simulated adverse conditions)
-5. Security audit (key handling, API exposure)
-6. Monitoring alerts
-7. Walk-forward validation of ALL strategies
-8. Parameter sensitivity analysis of ALL strategies
+### Phase 7: Hardening (Days 37–40)
+1. Comprehensive testing (crash recovery, network failure, risk limits)
+2. Security audit
+3. Performance profiling under load
+4. Documentation and operational runbook
+5. Final validation against all criteria
 
 ---
 
@@ -2143,9 +2174,18 @@ The system is NOT complete until ALL of the following are demonstrated:
 - [ ] Full replay: `replay(ledger) → identical state`
 - [ ] Cold restart from ledger replay in < 30 seconds
 - [ ] All CLI reports produce structured, parseable JSON output
+- [ ] Detection-to-order latency measured and < 3 seconds for WebSocket-triggered events
+
+### Intelligence Layer
+- [ ] Market classifier correctly assigns Type 1/2/3 to synthetic test markets
+- [ ] Cross-market consistency checker identifies known violations in real-time
+- [ ] Semantic market clustering groups related markets correctly
+- [ ] Stale-price propagation model has calibrated lag estimates for 10+ market pairs
+- [ ] Wallet delay analysis produces curves at sub-5s resolution with confidence intervals
+- [ ] Feature extraction produces continuous timeseries data for all defined features
 
 ### Research Factory
-- [ ] Hypothesis registry contains at least 10 registered hypotheses
+- [ ] Hypothesis registry contains at least 12 registered hypotheses
 - [ ] Walk-forward validation runs and produces per-period OOS results
 - [ ] Parameter sweep produces sensitivity surfaces with cliff detection
 - [ ] Ablation study identifies critical vs non-critical features for at least one strategy
@@ -2153,9 +2193,10 @@ The system is NOT complete until ALL of the following are demonstrated:
 
 ### Strategy Validation
 - [ ] At least one strategy shows positive EV in paper trading (>30 trades, p < 0.05)
-- [ ] Every strategy has walk-forward OOS Sharpe > 0.5
-- [ ] Every strategy survives ±20% parameter perturbation
-- [ ] Every strategy has regime-conditional performance breakdown
+- [ ] Every promoted strategy has walk-forward OOS Sharpe > 0.5
+- [ ] Every promoted strategy survives ±20% parameter perturbation
+- [ ] Every promoted strategy has regime-conditional performance breakdown
+- [ ] Counterfactual engine decomposes every signal into signal_alpha and execution_alpha
 
 ### Portfolio
 - [ ] Cross-strategy covariance matrix computed and updated daily
@@ -2167,21 +2208,19 @@ The system is NOT complete until ALL of the following are demonstrated:
 - [ ] Execution quality attribution separates signal alpha from execution alpha
 - [ ] Fill model predicts fill probability within 20% accuracy
 - [ ] Implementation shortfall computed for every trade
-
-### Market Structure
-- [ ] Cross-market consistency checker identifies violations in real-time
-- [ ] Semantic market clustering groups related markets correctly
-- [ ] Stale-price propagation model has calibrated lag estimates
+- [ ] Multi-leg execution for arb strategies handles leg failure gracefully
 
 ### Risk
 - [ ] Kill switch tested: triggers correctly on simulated drawdown
 - [ ] Portfolio-level drawdown control enforces tiered response
 - [ ] Max correlated exposure limits enforced
+- [ ] USD hard cap enforced independent of percentage-based limits
 
 ### Statistical Standards
 - [ ] No strategy promoted without p < 0.05, n ≥ 30, OOS Sharpe > 0.5
 - [ ] All PnL claims accompanied by confidence intervals
 - [ ] Multiple testing correction applied when testing > 5 hypotheses
+- [ ] Every strategy decomposed into theoretical edge, delayed edge, and captured edge
 
 ---
 
@@ -2190,15 +2229,18 @@ The system is NOT complete until ALL of the following are demonstrated:
 1. **Measure before you optimize.** If you can't quantify the edge, it doesn't exist.
 2. **Shadow before you trade.** Every strategy runs in paper mode until statistically validated.
 3. **Decompose every PnL.** Signal alpha, execution alpha, costs, luck. Know each one.
-4. **Distrust observed profits.** Compute t-statistics. Compute significance. Ask: "Would this survive out of sample?"
-5. **Kill strategies fast.** If a strategy cannot prove its edge in 30 trades, it probably doesn't have one.
-6. **Assume adversarial conditions.** Liquidity will disappear. Prices will move against you. Regimes will change. Alpha will decay. Plan for all of it.
-7. **Log everything.** The answer to every future question is in the logs.
-8. **Portfolio-level thinking.** Individual strategy PnL matters less than portfolio Sharpe. A mediocre uncorrelated strategy beats a strong correlated one.
-9. **Separate signal from execution.** They are different problems with different solutions. Never confuse them.
-10. **Continuous research.** The market evolves. Strategies decay. The system must discover new edges faster than old ones disappear.
-11. **Parameter humility.** If your strategy only works at parameter X = 0.6342, you don't have a strategy — you have a coincidence.
-12. **Opportunity cost discipline.** Every dollar of capital has a next-best use. Deploy it only when the current opportunity exceeds that.
+4. **Three edges, not one.** Track theoretical edge (is the signal right?), delayed edge (does it survive our latency?), and captured edge (what did we actually make?). Only captured edge matters.
+5. **Distrust observed profits.** Compute t-statistics. Compute significance. Ask: "Would this survive out of sample?"
+6. **Kill strategies fast.** If a strategy cannot prove its edge in 30 trades, it probably doesn't have one.
+7. **Assume adversarial conditions.** Liquidity will disappear. Prices will move against you. Regimes will change. Alpha will decay. Plan for all of it.
+8. **Log everything.** The answer to every future question is in the logs.
+9. **Portfolio-level thinking.** Individual strategy PnL matters less than portfolio Sharpe. A mediocre uncorrelated strategy beats a strong correlated one.
+10. **Separate signal from execution.** They are different problems with different solutions. Never confuse them.
+11. **Continuous research.** The market evolves. Strategies decay. The system must discover new edges faster than old ones disappear.
+12. **Parameter humility.** If your strategy only works at parameter X = 0.6342, you don't have a strategy — you have a coincidence.
+13. **Opportunity cost discipline.** Every dollar of capital has a next-best use. Deploy it only when the current opportunity exceeds that.
+14. **Latency is a feature, not a constraint.** Continuously measure and reduce the detection-to-order path. Every millisecond saved expands the set of capturable strategies.
+15. **Data collection compounds.** Start all observation pipelines as early as possible. A day of data collected before strategy development is a day of training data gained.
 
 ---
 
@@ -2221,8 +2263,13 @@ The system is NOT complete until ALL of the following are demonstrated:
 - ❌ Ignoring regime dependency — a strategy that only works in one regime is fragile
 - ❌ Deploying a strategy that is parameter-sensitive near a cliff
 - ❌ Trusting backtest results without OOS validation
-- ❌ Treating all wallet signals as equal — some wallets have NO edge after our delay
+- ❌ Treating all wallet signals as equal — check the delay curve at YOUR latency
 - ❌ Ignoring cross-market consistency — probability axiom violations are structural alpha
+- ❌ Anchoring latency assumptions on a crude prototype — measure the actual production path
+- ❌ Blanket-excluding wallet types (snipers, arbitrageurs) without checking their delay curves
+- ❌ Using REST polling where WebSocket subscriptions are available
+- ❌ Confusing theoretical edge with captured edge — only captured edge is real PnL
+- ❌ Building strategies without starting data collection first — data compounds in value
 
 ---
 
