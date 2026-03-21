@@ -135,6 +135,7 @@ export interface ConsistencyTradePlan {
 }
 
 export interface ConsistencyCheck {
+  check_id: string;
   check_type: ConsistencyCheckType;
   markets_involved: string[];
   expected_relationship: string;
@@ -143,4 +144,37 @@ export interface ConsistencyCheck {
   executable_violation: number;
   tradeable: boolean;
   trade_plan: ConsistencyTradePlan | null;
+  detected_at: number;
+}
+
+// ---------------------------------------------------------------------------
+// Violation persistence tracking
+// ---------------------------------------------------------------------------
+
+export interface ViolationPersistence {
+  check_id: string;
+  check_type: ConsistencyCheckType;
+  markets_involved: string[];
+  first_detected_at: number;
+  last_seen_at: number;
+  resolved_at: number | null;
+  duration_ms: number;
+  peak_magnitude: number;
+  peak_executable_magnitude: number;
+  observation_count: number;
+  was_tradeable: boolean;
+}
+
+export interface ConsistencyReport {
+  timestamp: number;
+  active_violations: ConsistencyCheck[];
+  violation_count_by_type: Record<ConsistencyCheckType, number>;
+  total_tradeable: number;
+  total_executable_profit: number;
+  persistence_stats: {
+    active_count: number;
+    resolved_last_hour: number;
+    median_duration_ms: number;
+    avg_duration_ms: number;
+  };
 }

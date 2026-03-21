@@ -280,7 +280,8 @@ describe('detectPropagationEvents', () => {
     // Simulate: mkt_1 updated at T=1000, mkt_2 updated at T=1500
     graphState.recordBookUpdate('mkt_2', 1500);
 
-    const edges = new Map<string, { target_market_id: string; relationship: 'correlated' as const; strength: number; price_correlation: number; staleness_propagation_lag_ms: number }[]>();
+    type EdgeEntry = { target_market_id: string; relationship: 'correlated'; strength: number; price_correlation: number; staleness_propagation_lag_ms: number };
+    const edges = new Map<string, EdgeEntry[]>();
     edges.set('mkt_1', [
       {
         target_market_id: 'mkt_2',
