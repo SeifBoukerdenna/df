@@ -598,6 +598,46 @@ export class PropagationModel {
     return this.events.get(key) ?? [];
   }
 
+  /**
+   * Returns all pending propagations where the given market is a target.
+   * Used by the StaleBook strategy to detect actionable lags.
+   */
+  getActivePendingForTarget(targetId: string): Array<{
+    source_market_id: string;
+    source_move: number;
+    source_move_sigma: number;
+    move_timestamp: number;
+    target_price_at_move: number;
+    correlation: number;
+  }> {
+    const results: Array<{
+      source_market_id: string;
+      source_move: number;
+      source_move_sigma: number;
+      move_timestamp: number;
+      target_price_at_move: number;
+      correlation: number;
+    }> = [];
+
+    for (const [, pendingList] of this.pendingMoves) {
+      for (const pending of pendingList) {
+        const target = pending.targets.get(targetId);
+        if (target) {
+          results.push({
+            source_market_id: pending.source_market_id,
+            source_move: pending.source_move,
+            source_move_sigma: pending.source_move_sigma,
+            move_timestamp: pending.move_timestamp,
+            target_price_at_move: target.price_at_source_move,
+            correlation: target.correlation,
+          });
+        }
+      }
+    }
+
+    return results;
+  }
+
   /** Returns total number of tracked pairs. */
   getTrackedPairCount(): number {
     return this.events.size;

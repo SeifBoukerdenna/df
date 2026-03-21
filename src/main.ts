@@ -39,6 +39,23 @@ import { FeatureEngine } from './research/feature_engine.js';
 import { MarketClassifier, recordBookUpdate, recordTrade, recordComplementGap } from './analytics/market_classifier.js';
 import { ConsistencyChecker } from './analytics/consistency_checker.js';
 import { PropagationModel } from './analytics/propagation_model.js';
+import { StrategyEngine } from './strategy/engine.js';
+import { WalletFollowStrategy } from './strategy/wallet_follow.js';
+import { ComplementArbStrategy } from './strategy/complement_arb.js';
+import { BookImbalanceStrategy } from './strategy/book_imbalance.js';
+import { LargeTradeReactionStrategy } from './strategy/large_trade_reaction.js';
+import { StaleBookStrategy } from './strategy/stale_book.js';
+import { CrossMarketConsistencyStrategy } from './strategy/cross_market_consistency.js';
+import { MicropriceDislocationStrategy } from './strategy/microprice_dislocation.js';
+import { paperExecute } from './execution/executor.js';
+import { Reconciliation } from './execution/reconciliation.js';
+import { scoreWallet } from './wallet_intel/scorer.js';
+import { classifyWallet } from './wallet_intel/classifier.js';
+import { computeWalletDelayCurve } from './wallet_intel/delay_analysis.js';
+import { computeWalletRegimeProfile } from './wallet_intel/regime_conditional.js';
+import { buildRegimeSpans } from './wallet_intel/regime_conditional.js';
+import type { WalletIntelProvider } from './strategy/wallet_follow.js';
+import type { PriceTimeseries } from './wallet_intel/types.js';
 import type { IngestionMetrics, ParsedTrade } from './ingestion/types.js';
 import type { ConsistencyCheck } from './analytics/types.js';
 
@@ -195,6 +212,35 @@ reportCmd
     printReport(report, !opts.json);
   });
 
+reportCmd
+  .command('pnl')
+  .description('PnL report with statistical significance per strategy')
+  .option('--json', 'Output raw JSON', false)
+  .option('--period <period>', 'Time period: 1h, 6h, 12h, 24h, 7d, 30d', '24h')
+  .option('--by <group>', 'Group by: strategy', 'strategy')
+  .option('--significance', 'Show only significant strategies (p < 0.05)', false)
+  .action(async (opts: { json: boolean; period: string; by: string; significance: boolean }) => {
+    // PnL report requires a running reconciliation engine — report from ledger replay
+    printReport({
+      note: 'PnL report available during live run. Start the system with `quant start` and use the report endpoint.',
+      period: opts.period,
+      group_by: opts.by,
+      significance_filter: opts.significance,
+    }, !opts.json);
+  });
+
+reportCmd
+  .command('positions')
+  .description('Open paper positions with unrealized PnL')
+  .option('--json', 'Output raw JSON', false)
+  .option('--show-ev', 'Show signal EV estimates', false)
+  .action(async (opts: { json: boolean; showEv: boolean }) => {
+    printReport({
+      note: 'Positions report available during live run. Start the system with `quant start`.',
+      show_ev: opts.showEv,
+    }, !opts.json);
+  });
+
 // ---------------------------------------------------------------------------
 // Daemon command (default: runs the full system)
 // ---------------------------------------------------------------------------
@@ -296,6 +342,65 @@ async function runSystem(): Promise<void> {
     consistencyViolations: lastConsistencyChecks,
     marketGraph: state.market_graph,
   }));
+
+  // ---------------------------------------------------------------------------
+  // Strategy Engine: register all 7 strategies in shadow mode
+  // ---------------------------------------------------------------------------
+
+  const strategyEngine = new StrategyEngine(ledger);
+  const reconciliation = new Reconciliation(ledger);
+
+  // Build WalletIntelProvider adapter
+  // Price history for delay curve computation (built from market state snapshots)
+  const priceHistory: Map<string, PriceTimeseries> = new Map();
+
+  const walletIntelProvider: WalletIntelProvider = {
+    getScore(address: string) {
+      const walletState = state.getWallet(address);
+      if (!walletState) return null;
+      const classification = classifyWallet(walletState);
+      const delayCurve = computeWalletDelayCurve(walletState, priceHistory);
+      const regimeSpans = buildRegimeSpans([{
+        timestamp: state.regime.regime_since,
+        regime: state.regime.current_regime,
+      }]);
+      const regimeProfile = computeWalletRegimeProfile(walletState, regimeSpans);
+      return scoreWallet({
+        wallet: walletState,
+        classification,
+        delayCurve,
+        regimeProfile,
+      });
+    },
+    getDelayCurve(address: string) {
+      const walletState = state.getWallet(address);
+      if (!walletState) return null;
+      return computeWalletDelayCurve(walletState, priceHistory);
+    },
+    getRegimeProfile(address: string) {
+      const walletState = state.getWallet(address);
+      if (!walletState) return null;
+      const regimeSpans = buildRegimeSpans([{
+        timestamp: state.regime.regime_since,
+        regime: state.regime.current_regime,
+      }]);
+      return computeWalletRegimeProfile(walletState, regimeSpans);
+    },
+  };
+
+  // Register strategies
+  strategyEngine.register(new WalletFollowStrategy(walletIntelProvider));
+  strategyEngine.register(new ComplementArbStrategy());
+  strategyEngine.register(new BookImbalanceStrategy());
+  strategyEngine.register(new LargeTradeReactionStrategy());
+  strategyEngine.register(new StaleBookStrategy(propagationModel));
+  strategyEngine.register(new CrossMarketConsistencyStrategy(consistencyChecker));
+  strategyEngine.register(new MicropriceDislocationStrategy());
+
+  log.info(
+    { strategies: strategyEngine.registeredIds(), paper_mode: config.paper_mode },
+    'All strategies registered in shadow mode',
+  );
 
   // Recent CLOB trades buffer for enriching wallet transactions
   const recentClobTrades: ParsedTrade[] = [];
@@ -539,6 +644,79 @@ async function runSystem(): Promise<void> {
   snapshotInterval.unref();
 
   // ---------------------------------------------------------------------------
+  // Strategy engine tick: evaluate all strategies every 5s
+  // ---------------------------------------------------------------------------
+
+  const strategyTickInterval = setInterval(() => {
+    try {
+      // Build edge map from classifier
+      const edgeMap = marketClassifier.buildEdgeMap(
+        config.risk.max_total_exposure_pct * 10_000, // total capital estimate
+      );
+
+      const result = strategyEngine.tick(state, edgeMap, marketClassifier);
+
+      if (result.signals_generated.length > 0) {
+        log.info(
+          {
+            generated: result.signals_generated.length,
+            filtered: result.signals_filtered.length,
+            markets: result.markets_evaluated,
+          },
+          'Strategy tick produced signals',
+        );
+
+        // Paper execution for each signal
+        if (config.paper_mode) {
+          for (const signal of result.signals_generated) {
+            const fillResult = paperExecute(signal, state, ledger, {
+              fee_rate: config.polymarket.fee_rate,
+              paper_mode: true,
+            });
+
+            if (fillResult.filled) {
+              reconciliation.openPosition(fillResult.execution, signal.ev_estimate);
+              strategyEngine.trackSignal(signal);
+            }
+          }
+        }
+      }
+
+      // Check kill conditions on live signals
+      const killed = strategyEngine.checkKillConditions(state);
+      for (const k of killed) {
+        // Close positions for killed signals
+        for (const pos of reconciliation.getOpenPositions()) {
+          if (pos.market_id === k.signal.market_id && pos.strategy_id === k.signal.strategy_id) {
+            const market = state.markets.get(pos.market_id);
+            if (market) {
+              const isYes = market.tokens.yes_id === pos.token_id;
+              const exitPrice = isYes ? market.book.yes.mid : market.book.no.mid;
+              reconciliation.closePosition(pos.position_id, exitPrice);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      log.warn({ err }, 'Strategy tick failed');
+    }
+  }, 5_000);
+  strategyTickInterval.unref();
+
+  // ---------------------------------------------------------------------------
+  // Mark-to-market: update position PnL every 10s
+  // ---------------------------------------------------------------------------
+
+  const mtmInterval = setInterval(() => {
+    try {
+      reconciliation.markToMarket(state);
+    } catch (err) {
+      log.warn({ err }, 'Mark-to-market failed');
+    }
+  }, 10_000);
+  mtmInterval.unref();
+
+  // ---------------------------------------------------------------------------
   // Graceful shutdown
   // ---------------------------------------------------------------------------
 
@@ -555,6 +733,8 @@ async function runSystem(): Promise<void> {
     clearInterval(classifyInterval);
     clearInterval(consistencyInterval);
     clearInterval(snapshotInterval);
+    clearInterval(strategyTickInterval);
+    clearInterval(mtmInterval);
 
     propagationModel.saveStatsSnapshot();
 
