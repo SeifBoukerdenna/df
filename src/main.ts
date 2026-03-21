@@ -17,6 +17,7 @@ import { BookPoller } from './ingestion/book_poller.js';
 import { MarketMetadataFetcher } from './ingestion/market_metadata.js';
 import { WalletListener } from './ingestion/wallet_listener.js';
 import { reportHealth, reportState, printReport } from './analytics/reports.js';
+import { FeatureEngine } from './research/feature_engine.js';
 import type { IngestionMetrics, ParsedTrade } from './ingestion/types.js';
 
 const log = getLogger('main');
@@ -129,6 +130,24 @@ async function runSystem(): Promise<void> {
     ledger.append({ type: 'regime_change', data: { from, to, confidence } });
     log.info({ from, to, confidence }, 'Regime change logged to ledger');
   };
+
+  // ---------------------------------------------------------------------------
+  // Feature extraction engine: captures all features every 60s
+  // ---------------------------------------------------------------------------
+
+  const featureEngine = new FeatureEngine({
+    outputDir: config.features.dir,
+    minVolume24h: 1000,
+    captureIntervalMs: config.features.capture_interval_ms,
+  });
+
+  featureEngine.start(() => ({
+    markets: state.getAllMarkets(),
+    wallets: state.getAllWallets(),
+    regime: state.regime,
+    consistencyViolations: [], // populated once consistency checker is wired in Phase 3
+    marketGraph: state.market_graph,
+  }));
 
   // Recent CLOB trades buffer for enriching wallet transactions
   const recentClobTrades: ParsedTrade[] = [];
@@ -289,6 +308,7 @@ async function runSystem(): Promise<void> {
     metadataFetcher.stop();
     walletListener.stop();
     state.stopRegimeDetection();
+    featureEngine.stop();
 
     clearInterval(snapshotInterval);
 
