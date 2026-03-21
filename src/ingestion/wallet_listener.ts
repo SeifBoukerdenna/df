@@ -207,18 +207,30 @@ export class WalletListener extends EventEmitter {
           this.handleDisconnect('provider_ready_failed');
         });
 
-      // Listen for websocket close/error via the underlying websocket
-      const ws = (provider as unknown as { _websocket?: { on?: Function } })._websocket;
-      if (ws && typeof ws.on === 'function') {
-        ws.on('close', () => {
-          if (this.provider === provider) {
-            this.handleDisconnect('ws_closed');
-          }
-        });
-        ws.on('error', (err: Error) => {
-          log.warn({ err }, 'WalletListener WebSocket error');
-          this.emit('error', err);
-        });
+      // Attach onerror to the underlying WebSocket (ethers v6 uses a public 'websocket'
+      // getter with browser-style onerror interface but does NOT set onerror itself,
+      // leaving 502/503 errors as unhandled EventEmitter 'error' events that crash Node)
+      try {
+        const ws = (provider as unknown as { websocket: { onerror?: unknown } }).websocket;
+        if (ws && typeof ws === 'object') {
+          ws.onerror = (evt: unknown) => {
+            let err: Error;
+            if (evt instanceof Error) {
+              err = evt;
+            } else if (evt !== null && typeof evt === 'object' && 'message' in evt) {
+              err = new Error(String((evt as { message: unknown }).message));
+            } else {
+              err = new Error('WebSocket error');
+            }
+            log.warn({ err }, 'WalletListener WebSocket error');
+            this.emit('error', err);
+            if (this.provider === provider) {
+              this.handleDisconnect('ws_error');
+            }
+          };
+        }
+      } catch {
+        // websocket getter throws if connection already failed — safe to ignore
       }
     } catch (err) {
       log.warn({ err }, 'WalletListener connect failed');

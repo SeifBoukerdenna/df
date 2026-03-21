@@ -10,7 +10,8 @@ import type { IngestionSourceMetrics } from './types.js';
 const log = getLogger('clob_ws');
 
 const SOURCE = 'clob_ws';
-const HEARTBEAT_TIMEOUT_MS = 30_000;
+const HEARTBEAT_TIMEOUT_MS = 90_000;  // 90s — market WS can be silent during quiet periods
+const PING_INTERVAL_MS = 20_000;       // send WS-level ping every 20s to keep connection alive
 
 // ---------------------------------------------------------------------------
 // Events
@@ -54,6 +55,7 @@ export class ClobWebSocket extends EventEmitter {
 
   // Heartbeat
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
 
   // Dedup cache: key → expiry timestamp
   private readonly dedupCache = new Map<string, number>();
@@ -108,6 +110,7 @@ export class ClobWebSocket extends EventEmitter {
   stop(): void {
     this.running = false;
     this.clearHeartbeat();
+    this.clearPing();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -147,6 +150,7 @@ export class ClobWebSocket extends EventEmitter {
       log.info('ClobWebSocket connected');
       this.reconnectAttempt = 0;
       this.resetHeartbeat();
+      this.startPing(ws);
       this.emit('connected');
 
       // Subscribe to all market trades
@@ -162,9 +166,14 @@ export class ClobWebSocket extends EventEmitter {
       const reasonStr = reason.toString();
       log.warn({ code, reason: reasonStr }, 'ClobWebSocket disconnected');
       this.clearHeartbeat();
+      this.clearPing();
       this.ws = null;
       this.emit('disconnected', code, reasonStr);
       if (this.running) this.scheduleReconnect();
+    });
+
+    ws.on('pong', () => {
+      this.resetHeartbeat(); // pong confirms connection is alive
     });
 
     ws.on('error', (err: Error) => {
@@ -175,7 +184,7 @@ export class ClobWebSocket extends EventEmitter {
   }
 
   private scheduleReconnect(): void {
-    if (!this.running) return;
+    if (!this.running || this.reconnectTimer !== null) return;
 
     const base = Math.min(
       this.reconnectBaseMs * Math.pow(2, this.reconnectAttempt),
@@ -204,10 +213,11 @@ export class ClobWebSocket extends EventEmitter {
     this.heartbeatTimer = setTimeout(() => {
       log.warn('ClobWebSocket heartbeat timeout — forcing reconnect');
       if (this.ws !== null) {
-        this.ws.terminate();
+        this.ws.terminate(); // triggers 'close' event → scheduleReconnect()
         this.ws = null;
+      } else if (this.running) {
+        this.scheduleReconnect();
       }
-      if (this.running) this.scheduleReconnect();
     }, HEARTBEAT_TIMEOUT_MS);
   }
 
@@ -215,6 +225,27 @@ export class ClobWebSocket extends EventEmitter {
     if (this.heartbeatTimer !== null) {
       clearTimeout(this.heartbeatTimer);
       this.heartbeatTimer = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ping (keep-alive)
+  // ---------------------------------------------------------------------------
+
+  private startPing(ws: WebSocket): void {
+    this.clearPing();
+    this.pingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      }
+    }, PING_INTERVAL_MS);
+    this.pingTimer.unref();
+  }
+
+  private clearPing(): void {
+    if (this.pingTimer !== null) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
     }
   }
 
