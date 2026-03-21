@@ -121,6 +121,15 @@ async function runSystem(): Promise<void> {
     state.registerWallet(addr);
   }
 
+  // ---------------------------------------------------------------------------
+  // Regime detection: 60s interval, logs changes to ledger
+  // ---------------------------------------------------------------------------
+
+  state.onRegimeChange = (from, to, confidence) => {
+    ledger.append({ type: 'regime_change', data: { from, to, confidence } });
+    log.info({ from, to, confidence }, 'Regime change logged to ledger');
+  };
+
   // Recent CLOB trades buffer for enriching wallet transactions
   const recentClobTrades: ParsedTrade[] = [];
   const MAX_RECENT_TRADES = 500;
@@ -137,11 +146,17 @@ async function runSystem(): Promise<void> {
     if (meta.tokens.yes_id) bookPoller.addToken(meta.tokens.yes_id, meta.market_id);
     if (meta.tokens.no_id) bookPoller.addToken(meta.tokens.no_id, meta.market_id);
 
+    // Feed new market event to regime detector
+    state.regimeDetector.recordNewMarket(now());
+
     ledger.append({ type: 'system_event', data: { event: 'market_created', details: meta } });
     log.info({ market_id: meta.market_id, question: meta.question }, 'Market registered');
   });
 
   metadataFetcher.on('market_resolved', (meta) => {
+    // Feed resolution event to regime detector
+    state.regimeDetector.recordResolution(now());
+
     ledger.append({ type: 'system_event', data: { event: 'market_resolved', details: meta } });
     log.info(
       { market_id: meta.market_id, resolution: meta.resolution },
@@ -273,6 +288,7 @@ async function runSystem(): Promise<void> {
     bookPoller.stop();
     metadataFetcher.stop();
     walletListener.stop();
+    state.stopRegimeDetection();
 
     clearInterval(snapshotInterval);
 
@@ -299,8 +315,9 @@ async function runSystem(): Promise<void> {
   bookPoller.start();
   clobWs.start();
   walletListener.start();
+  state.startRegimeDetection();
 
-  log.info('All ingestion components started');
+  log.info('All ingestion components started (regime detection every 60s)');
 }
 
 // ---------------------------------------------------------------------------

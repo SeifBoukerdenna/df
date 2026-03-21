@@ -2,7 +2,8 @@ import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { now } from '../utils/time.js';
 import { getLogger } from '../utils/logger.js';
-import { detectRegime } from './regime_detector.js';
+import { detectRegime, RegimeDetector } from './regime_detector.js';
+import type { RegimeDetectorConfig } from './regime_detector.js';
 import { createEmptyMarketState, updateBookFromSnapshot, updateBookFromTrade } from './market_state.js';
 import { createEmptyWalletState, recomputeWalletStats } from './wallet_stats.js';
 import type {
@@ -78,9 +79,69 @@ export class WorldState implements IWorldState {
   regime: RegimeState;
   system_clock: number;
 
-  constructor() {
+  /** The regime detector instance — available for event recording and inspection */
+  readonly regimeDetector: RegimeDetector;
+
+  private regimeInterval: ReturnType<typeof setInterval> | null = null;
+
+  /** Optional callback invoked on regime change (set by caller for ledger logging) */
+  onRegimeChange: ((from: string, to: string, confidence: number) => void) | null = null;
+
+  constructor(regimeConfig?: Partial<RegimeDetectorConfig>) {
+    this.regimeDetector = new RegimeDetector(regimeConfig);
     this.regime = detectRegime();
     this.system_clock = now();
+  }
+
+  // -----------------------------------------------------------------------
+  // Regime detection — runs every 60 seconds
+  // -----------------------------------------------------------------------
+
+  /**
+   * Starts the 60-second regime detection interval.
+   * Call stopRegimeDetection() on shutdown.
+   */
+  startRegimeDetection(): void {
+    if (this.regimeInterval) return;
+    this.regimeInterval = setInterval(() => this.runRegimeDetection(), 60_000);
+    if (this.regimeInterval.unref) this.regimeInterval.unref();
+    log.info('Regime detection started (60s interval)');
+  }
+
+  /** Stops the regime detection interval. */
+  stopRegimeDetection(): void {
+    if (this.regimeInterval) {
+      clearInterval(this.regimeInterval);
+      this.regimeInterval = null;
+    }
+  }
+
+  /**
+   * Runs a single regime detection tick.
+   * Computes active wallet count from recent trades and delegates to the detector.
+   * Can be called manually for testing or on-demand detection.
+   */
+  runRegimeDetection(nowMs: number = now()): RegimeState {
+    const previousRegime = this.regime.current_regime;
+
+    // Count wallets with trades in the last 60 seconds
+    const oneMinuteAgo = nowMs - 60_000;
+    let activeWalletCount = 0;
+    for (const wallet of this.wallets.values()) {
+      const hasRecentTrade = wallet.trades.some((t) => t.timestamp > oneMinuteAgo);
+      if (hasRecentTrade) activeWalletCount++;
+    }
+
+    const allMarkets = this.getAllMarkets();
+    const newState = this.regimeDetector.detect(allMarkets, activeWalletCount, nowMs);
+    this.regime = newState;
+
+    // Notify on regime change (for ledger logging)
+    if (newState.current_regime !== previousRegime && this.onRegimeChange) {
+      this.onRegimeChange(previousRegime, newState.current_regime, newState.confidence);
+    }
+
+    return newState;
   }
 
   // -----------------------------------------------------------------------

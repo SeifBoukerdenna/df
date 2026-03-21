@@ -477,3 +477,113 @@ describe('WorldState serialize/load', () => {
     expect(() => JSON.parse(json)).not.toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regime detection integration
+// ---------------------------------------------------------------------------
+
+describe('WorldState regime detection', () => {
+  it('exposes a RegimeDetector instance', () => {
+    const ws = new WorldState();
+    expect(ws.regimeDetector).toBeDefined();
+    expect(typeof ws.regimeDetector.detect).toBe('function');
+  });
+
+  it('runRegimeDetection updates state.regime', () => {
+    const ws = new WorldState();
+    const before = ws.regime.current_regime;
+    const result = ws.runRegimeDetection(Date.now());
+    expect(result.current_regime).toBe(before); // stays normal with no data
+    expect(ws.regime).toBe(result);
+  });
+
+  it('runRegimeDetection counts active wallets from recent trades', () => {
+    const ws = new WorldState();
+    const nowMs = Date.now();
+
+    ws.registerWallet('0xaaa');
+    ws.recordWalletTrade({
+      wallet: '0xaaa',
+      market_id: 'mkt_1',
+      token_id: 'tok_1',
+      side: 'BUY',
+      price: 0.5,
+      size: 100,
+      timestamp: nowMs - 30_000, // 30s ago — within 60s window
+      tx_hash: '0xtx1',
+      block_number: 100,
+      gas_price: 30_000_000_000,
+    });
+
+    // Should not throw, and the detector receives activeWalletCount=1
+    const result = ws.runRegimeDetection(nowMs);
+    expect(result.current_regime).toBe('normal');
+  });
+
+  it('fires onRegimeChange callback on regime transition', () => {
+    const ws = new WorldState({ min_observations: 5, regime_change_persistence: 1 });
+
+    // Build baseline with normal markets
+    for (let i = 0; i < 15; i++) {
+      const meta = makeMetadata(`m_${i}`);
+      ws.registerMarket(meta);
+    }
+
+    // Seed normal history
+    const t0 = 1_000_000;
+    for (let i = 0; i < 15; i++) {
+      // Set normal spread/volume on all markets
+      for (const m of ws.markets.values()) {
+        m.book.yes.spread_bps = 200 + Math.sin(i) * 20;
+        m.book.no.spread_bps = 200 + Math.cos(i) * 20;
+        m.volume_1h = 1000 + i * 10;
+      }
+      ws.runRegimeDetection(t0 + i * 60_000);
+    }
+    expect(ws.regime.current_regime).toBe('normal');
+
+    // Track regime changes via callback
+    const changes: { from: string; to: string; confidence: number }[] = [];
+    ws.onRegimeChange = (from, to, confidence) => {
+      changes.push({ from, to, confidence });
+    };
+
+    // Now inject extreme conditions — wide spreads + high volume = high_volatility
+    const hvTime = t0 + 15 * 60_000;
+    for (let i = 0; i < 5; i++) {
+      for (const m of ws.markets.values()) {
+        m.book.yes.spread_bps = 3000;
+        m.book.no.spread_bps = 3000;
+        m.volume_1h = 100_000;
+      }
+      ws.runRegimeDetection(hvTime + i * 60_000);
+    }
+
+    expect(ws.regime.current_regime).toBe('high_volatility');
+    expect(changes.length).toBeGreaterThanOrEqual(1);
+    expect(changes[0]!.from).toBe('normal');
+    expect(changes[0]!.to).toBe('high_volatility');
+    expect(changes[0]!.confidence).toBeGreaterThan(0);
+  });
+
+  it('startRegimeDetection and stopRegimeDetection manage the interval', () => {
+    const ws = new WorldState();
+    ws.startRegimeDetection();
+    // Starting twice should be idempotent
+    ws.startRegimeDetection();
+    // Stop should not throw
+    ws.stopRegimeDetection();
+    ws.stopRegimeDetection(); // double stop is safe
+  });
+
+  it('regime detector receives resolution events via regimeDetector', () => {
+    const ws = new WorldState({ min_observations: 5, regime_change_persistence: 1 });
+    // Record resolutions through the public API
+    ws.regimeDetector.recordResolution(Date.now());
+    ws.regimeDetector.recordResolution(Date.now());
+
+    // Should not throw
+    const result = ws.runRegimeDetection(Date.now());
+    expect(result).toBeDefined();
+  });
+});
