@@ -2,7 +2,7 @@
 // Wallet Intelligence — Type Definitions
 // ---------------------------------------------------------------------------
 
-import type { WalletClassification } from '../state/types.js';
+import type { WalletClassification, WalletStats, RegimeName } from '../state/types.js';
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -67,6 +67,68 @@ export interface WalletDelayCurve {
   followable_at_latency: boolean;
   recommendation: 'follow' | 'shadow_only' | 'ignore' | 'fade';
 }
+
+// ---------------------------------------------------------------------------
+// Scoring
+// ---------------------------------------------------------------------------
+
+export interface WalletScoreComponents {
+  raw_profitability: number;
+  delayed_profitability: number;
+  consistency: number;
+  statistical_significance: number;
+  sample_size: number;
+  recency: number;
+  regime_robustness: number;
+}
+
+export interface FollowParameters {
+  optimal_delay_ms: number;
+  min_trade_size_to_follow: number;
+  max_allocation_per_follow: number;
+  allowed_market_types: string[];
+  confidence_interval_90: [number, number];
+}
+
+export interface WalletScore {
+  address: string;
+  label: string;
+  classification: WalletClassification;
+  overall_score: number;
+  components: WalletScoreComponents;
+  recommendation: 'follow' | 'shadow_only' | 'ignore' | 'fade';
+  follow_parameters: FollowParameters | null;
+}
+
+// ---------------------------------------------------------------------------
+// Regime-Conditional Performance
+// ---------------------------------------------------------------------------
+
+export interface RegimePerformanceEntry {
+  regime: RegimeName;
+  stats: WalletStats;
+  n_trades: number;
+  sharpe: number;
+  win_rate: number;
+  pnl_realized: number;
+  is_significant: boolean;
+  t_statistic: number;
+  p_value: number;
+}
+
+export interface WalletRegimeProfile {
+  address: string;
+  label: string;
+  regime_entries: RegimePerformanceEntry[];
+  best_regime: RegimeName | null;
+  worst_regime: RegimeName | null;
+  regime_sensitive: boolean;
+  robustness_score: number;
+}
+
+// ---------------------------------------------------------------------------
+// Price data
+// ---------------------------------------------------------------------------
 
 export interface PriceAtTime {
   timestamp: number;
