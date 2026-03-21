@@ -16,9 +16,23 @@ import { ClobWebSocket } from './ingestion/clob_websocket.js';
 import { BookPoller } from './ingestion/book_poller.js';
 import { MarketMetadataFetcher } from './ingestion/market_metadata.js';
 import { WalletListener } from './ingestion/wallet_listener.js';
-import { reportHealth, reportState, printReport } from './analytics/reports.js';
+import {
+  reportHealth,
+  reportState,
+  reportMarkets,
+  reportMarketsEdgeOnly,
+  reportWallets,
+  reportConsistency,
+  reportRegime,
+  reportPropagation,
+  printReport,
+} from './analytics/reports.js';
 import { FeatureEngine } from './research/feature_engine.js';
+import { MarketClassifier, recordBookUpdate, recordTrade, recordComplementGap } from './analytics/market_classifier.js';
+import { ConsistencyChecker } from './analytics/consistency_checker.js';
+import { PropagationModel } from './analytics/propagation_model.js';
 import type { IngestionMetrics, ParsedTrade } from './ingestion/types.js';
+import type { ConsistencyCheck } from './analytics/types.js';
 
 const log = getLogger('main');
 
@@ -59,6 +73,76 @@ reportCmd
     printReport(report, !opts.json);
   });
 
+reportCmd
+  .command('markets')
+  .description('Market classification report (Type 1/2/3, efficiency, viable strategies)')
+  .option('--json', 'Output raw JSON', false)
+  .option('--edge-only', 'Show EdgeMap only (capital allocation per market)', false)
+  .action(async (opts: { json: boolean; edgeOnly: boolean }) => {
+    const config = cfg;
+    const state = await loadOrCreateState(config);
+    const classifier = new MarketClassifier(config.strategies.wallet_follow['default_latency_ms'] as number ?? 2000);
+    classifier.classifyAll(state.markets, 'scheduled');
+
+    if (opts.edgeOnly) {
+      const edgeMap = reportMarketsEdgeOnly(classifier, 10_000);
+      printReport(edgeMap, !opts.json);
+    } else {
+      const report = reportMarkets(state, classifier);
+      printReport(report, !opts.json);
+    }
+  });
+
+reportCmd
+  .command('wallets')
+  .description('Wallet performance analysis with PnL, Sharpe, and delay curves')
+  .option('--json', 'Output raw JSON', false)
+  .option('--sort <field>', 'Sort by: pnl_realized | delayed_pnl | sharpe | win_rate | total_trades', 'pnl_realized')
+  .option('--min-trades <n>', 'Minimum trade count to include', '0')
+  .action(async (opts: { json: boolean; sort: string; minTrades: string }) => {
+    const config = cfg;
+    const state = await loadOrCreateState(config);
+    const report = reportWallets(state, opts.sort, parseInt(opts.minTrades, 10));
+    printReport(report, !opts.json);
+  });
+
+reportCmd
+  .command('consistency')
+  .description('Cross-market probability consistency violations')
+  .option('--json', 'Output raw JSON', false)
+  .action(async (opts: { json: boolean }) => {
+    const config = cfg;
+    const state = await loadOrCreateState(config);
+    const checker = new ConsistencyChecker(config.polymarket.fee_rate);
+    const checks = checker.checkAll(state.markets, state.market_graph);
+    const report = reportConsistency(checker, checks);
+    printReport(report, !opts.json);
+  });
+
+reportCmd
+  .command('regime')
+  .description('Current market regime, features, transition matrix, and duration stats')
+  .option('--json', 'Output raw JSON', false)
+  .action(async (opts: { json: boolean }) => {
+    const config = cfg;
+    const state = await loadOrCreateState(config);
+    const report = reportRegime(state);
+    printReport(report, !opts.json);
+  });
+
+reportCmd
+  .command('propagation')
+  .description('Stale-price propagation pairs sorted by exploitable lag')
+  .option('--json', 'Output raw JSON', false)
+  .action(async (opts: { json: boolean }) => {
+    const config = cfg;
+    const propagationModel = new PropagationModel(
+      config.strategies.wallet_follow['default_latency_ms'] as number ?? 2000,
+    );
+    const report = reportPropagation(propagationModel);
+    printReport(report, !opts.json);
+  });
+
 // ---------------------------------------------------------------------------
 // Daemon command (default: runs the full system)
 // ---------------------------------------------------------------------------
@@ -88,6 +172,18 @@ async function runSystem(): Promise<void> {
   // Core components
   const state = new WorldState();
   const ledger = new Ledger(config.ledger.dir);
+
+  // Analytics: market classification, consistency, propagation
+  const marketClassifier = new MarketClassifier(
+    config.strategies.wallet_follow['default_latency_ms'] as number ?? 2000,
+  );
+  const consistencyChecker = new ConsistencyChecker(config.polymarket.fee_rate);
+  const propagationModel = new PropagationModel(
+    config.strategies.wallet_follow['default_latency_ms'] as number ?? 2000,
+  );
+
+  // Last consistency check results (shared with featureEngine)
+  let lastConsistencyChecks: ConsistencyCheck[] = [];
 
   // Ingestion
   const metadataFetcher = new MarketMetadataFetcher(
@@ -145,7 +241,7 @@ async function runSystem(): Promise<void> {
     markets: state.getAllMarkets(),
     wallets: state.getAllWallets(),
     regime: state.regime,
-    consistencyViolations: [], // populated once consistency checker is wired in Phase 3
+    consistencyViolations: lastConsistencyChecks,
     marketGraph: state.market_graph,
   }));
 
@@ -183,7 +279,7 @@ async function runSystem(): Promise<void> {
     );
   });
 
-  // Book snapshots from REST poller → state update
+  // Book snapshots from REST poller → state update + classifier observations + propagation
   bookPoller.on('book_snapshot', (snapshot) => {
     const markets = state.getAllMarkets();
     const market = markets.find(
@@ -193,10 +289,27 @@ async function runSystem(): Promise<void> {
       state.updateMarket(snapshot);
       // Keep ClobWebSocket's pre-trade book state in sync
       clobWs.updateBookSnapshot(snapshot);
+
+      // Feed book update to market classifier observations
+      const side = market.tokens.yes_id === snapshot.token_id ? 'yes' : 'no';
+      const updatedMarket = state.getMarket(market.market_id);
+      if (updatedMarket) {
+        const obs = marketClassifier.getObservations(market.market_id);
+        recordBookUpdate(obs, updatedMarket, side);
+
+        // Record complement gap
+        if (updatedMarket.complement_gap_executable !== 0) {
+          recordComplementGap(obs, snapshot.timestamp, Math.abs(updatedMarket.complement_gap_executable), config.polymarket.fee_rate);
+        }
+
+        // Feed mid-price to propagation model
+        const mid = side === 'yes' ? updatedMarket.book.yes.mid : updatedMarket.book.no.mid;
+        propagationModel.onPriceUpdate(market.market_id, mid, snapshot.timestamp, state.market_graph);
+      }
     }
   });
 
-  // Book snapshots from WebSocket → state update
+  // Book snapshots from WebSocket → state update + classifier + propagation
   clobWs.on('book_snapshot', (snapshot) => {
     const markets = state.getAllMarkets();
     const market = markets.find(
@@ -204,10 +317,22 @@ async function runSystem(): Promise<void> {
     );
     if (market) {
       state.updateMarket(snapshot);
+
+      // Feed book update to classifier observations
+      const side = market.tokens.yes_id === snapshot.token_id ? 'yes' : 'no';
+      const updatedMarket = state.getMarket(market.market_id);
+      if (updatedMarket) {
+        const obs = marketClassifier.getObservations(market.market_id);
+        recordBookUpdate(obs, updatedMarket, side);
+
+        // Feed mid-price to propagation model
+        const mid = side === 'yes' ? updatedMarket.book.yes.mid : updatedMarket.book.no.mid;
+        propagationModel.onPriceUpdate(market.market_id, mid, snapshot.timestamp, state.market_graph);
+      }
     }
   });
 
-  // Trades from WebSocket → state update + recent buffer for wallet enrichment
+  // Trades from WebSocket → state update + classifier observations + wallet buffer
   clobWs.on('trade', (trade) => {
     const markets = state.getAllMarkets();
     const market = markets.find(
@@ -215,6 +340,11 @@ async function runSystem(): Promise<void> {
     );
     if (market) {
       state.updateMarketFromTrade(trade);
+
+      // Feed trade to classifier observations
+      const obs = marketClassifier.getObservations(market.market_id);
+      const sizeUsd = trade.price * trade.size;
+      recordTrade(obs, trade.timestamp, sizeUsd, trade.maker ?? '', trade.taker ?? '', null);
     }
 
     // Buffer for wallet trade enrichment
@@ -283,12 +413,72 @@ async function runSystem(): Promise<void> {
   walletListener.on('error', (err) => log.warn({ err }, 'WalletListener error'));
 
   // ---------------------------------------------------------------------------
+  // Periodic market classification (every 60s)
+  // ---------------------------------------------------------------------------
+
+  const classifyInterval = setInterval(() => {
+    try {
+      const events = marketClassifier.classifyAll(state.markets, 'scheduled');
+      for (const evt of events) {
+        ledger.append({
+          type: 'system_event',
+          data: { event: 'market_reclassified', details: evt },
+        });
+      }
+      log.debug(
+        { markets: state.markets.size, reclassified: events.length },
+        'Market classification tick',
+      );
+    } catch (err) {
+      log.warn({ err }, 'Market classification failed');
+    }
+  }, 60_000);
+  classifyInterval.unref();
+
+  // ---------------------------------------------------------------------------
+  // Periodic consistency check (every 60s)
+  // ---------------------------------------------------------------------------
+
+  const consistencyInterval = setInterval(() => {
+    try {
+      const checks = consistencyChecker.checkAll(state.markets, state.market_graph);
+      lastConsistencyChecks = checks;
+
+      const tradeable = checks.filter((c) => c.tradeable);
+      if (tradeable.length > 0) {
+        log.info(
+          { total: checks.length, tradeable: tradeable.length },
+          'Consistency violations detected',
+        );
+        ledger.append({
+          type: 'system_event',
+          data: {
+            event: 'consistency_violations',
+            details: {
+              total: checks.length,
+              tradeable: tradeable.length,
+              total_executable_profit: tradeable.reduce(
+                (s, c) => s + c.executable_violation,
+                0,
+              ),
+            },
+          },
+        });
+      }
+    } catch (err) {
+      log.warn({ err }, 'Consistency check failed');
+    }
+  }, 60_000);
+  consistencyInterval.unref();
+
+  // ---------------------------------------------------------------------------
   // Periodic state snapshot
   // ---------------------------------------------------------------------------
 
   const snapshotInterval = setInterval(() => {
     try {
       state.saveToDisk(config.state.snapshots_dir);
+      propagationModel.saveStatsSnapshot();
       log.debug('State snapshot saved');
     } catch (err) {
       log.warn({ err }, 'Failed to save state snapshot');
@@ -310,7 +500,11 @@ async function runSystem(): Promise<void> {
     state.stopRegimeDetection();
     featureEngine.stop();
 
+    clearInterval(classifyInterval);
+    clearInterval(consistencyInterval);
     clearInterval(snapshotInterval);
+
+    propagationModel.saveStatsSnapshot();
 
     try {
       state.saveToDisk(config.state.snapshots_dir);
