@@ -27,6 +27,14 @@ import {
   reportPropagation,
   printReport,
 } from './analytics/reports.js';
+import {
+  reportCounterfactual,
+  reportViability,
+} from './counterfactual/shadow_engine.js';
+import {
+  reportAttribution,
+  parsePeriod,
+} from './counterfactual/attribution.js';
 import { FeatureEngine } from './research/feature_engine.js';
 import { MarketClassifier, recordBookUpdate, recordTrade, recordComplementGap } from './analytics/market_classifier.js';
 import { ConsistencyChecker } from './analytics/consistency_checker.js';
@@ -140,6 +148,50 @@ reportCmd
       config.strategies.wallet_follow['default_latency_ms'] as number ?? 2000,
     );
     const report = reportPropagation(propagationModel);
+    printReport(report, !opts.json);
+  });
+
+reportCmd
+  .command('counterfactual')
+  .description('Counterfactual PnL analysis per strategy: ideal vs actual, cost decomposition')
+  .option('--json', 'Output raw JSON', false)
+  .option('--strategy <id>', 'Filter to a specific strategy ID')
+  .action(async (opts: { json: boolean; strategy?: string }) => {
+    if (opts.strategy) {
+      const report = reportCounterfactual(opts.strategy);
+      printReport(report, !opts.json);
+    } else {
+      // Report all strategies that have records
+      const allReports = [
+        'wallet_follow', 'complement_arb', 'book_imbalance',
+        'large_trade_reaction', 'stale_book', 'cross_market_consistency',
+        'microprice_dislocation',
+      ].map(sid => reportCounterfactual(sid))
+        .filter(r => r.total_signals > 0);
+      printReport(allReports, !opts.json);
+    }
+  });
+
+reportCmd
+  .command('viability')
+  .description('Signal viability at different latencies per strategy')
+  .option('--json', 'Output raw JSON', false)
+  .option('--strategy <id>', 'Filter to a specific strategy ID')
+  .action(async (opts: { json: boolean; strategy?: string }) => {
+    const report = reportViability(opts.strategy);
+    printReport(report, !opts.json);
+  });
+
+reportCmd
+  .command('attribution')
+  .description('Signal vs execution attribution per strategy per time period')
+  .option('--json', 'Output raw JSON', false)
+  .option('--period <period>', 'Time period: 1d, 7d, 14d, 30d', '7d')
+  .option('--strategy <id>', 'Filter to a specific strategy ID')
+  .action(async (opts: { json: boolean; period: string; strategy?: string }) => {
+    const periodMs = parsePeriod(opts.period);
+    const { now: nowFn } = await import('./utils/time.js');
+    const report = reportAttribution(periodMs, nowFn(), opts.strategy);
     printReport(report, !opts.json);
   });
 
