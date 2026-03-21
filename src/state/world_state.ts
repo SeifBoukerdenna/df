@@ -4,6 +4,7 @@ import { now } from '../utils/time.js';
 import { getLogger } from '../utils/logger.js';
 import { detectRegime } from './regime_detector.js';
 import { createEmptyMarketState, updateBookFromSnapshot, updateBookFromTrade } from './market_state.js';
+import { createEmptyWalletState, recomputeWalletStats } from './wallet_stats.js';
 import type {
   WorldState as IWorldState,
   MarketState,
@@ -12,7 +13,7 @@ import type {
   MarketGraph,
   RegimeState,
 } from './types.js';
-import type { MarketMetadata, ParsedBookSnapshot, ParsedTrade } from '../ingestion/types.js';
+import type { MarketMetadata, ParsedBookSnapshot, ParsedTrade, WalletTransaction } from '../ingestion/types.js';
 
 const log = getLogger('state');
 
@@ -124,6 +125,110 @@ export class WorldState implements IWorldState {
     const updated = updateBookFromTrade(existing, trade);
     this.markets.set(trade.market_id, updated);
     this.system_clock = now();
+  }
+
+  // -----------------------------------------------------------------------
+  // Wallet tracking
+  // -----------------------------------------------------------------------
+
+  /**
+   * Registers a wallet for tracking. No-op if already registered.
+   */
+  registerWallet(address: string, label?: string): void {
+    const lower = address.toLowerCase();
+    if (this.wallets.has(lower)) return;
+    this.wallets.set(lower, createEmptyWalletState(lower, label));
+  }
+
+  /**
+   * Records a wallet transaction and recomputes stats.
+   * Auto-registers the wallet if not already tracked.
+   */
+  recordWalletTrade(tx: WalletTransaction): void {
+    const addr = tx.wallet.toLowerCase();
+    let wallet = this.wallets.get(addr);
+    if (!wallet) {
+      wallet = createEmptyWalletState(addr);
+      this.wallets.set(addr, wallet);
+    }
+
+    wallet.trades.push(tx);
+    wallet.stats = recomputeWalletStats(wallet.trades);
+    this.system_clock = now();
+  }
+
+  /**
+   * Records a wallet transaction with regime-conditional tracking.
+   * Recomputes both overall stats and stats for the current regime.
+   */
+  recordWalletTradeWithRegime(tx: WalletTransaction): void {
+    this.recordWalletTrade(tx);
+
+    const addr = tx.wallet.toLowerCase();
+    const wallet = this.wallets.get(addr);
+    if (!wallet) return;
+
+    const regimeName = this.regime.current_regime;
+    const regimeTrades = wallet.trades.filter((t) => {
+      // Approximate: assign trades to current regime
+      // More precise regime assignment requires storing regime at trade time
+      return true; // For now, all trades go into current regime bucket
+    });
+
+    wallet.regime_performance.set(regimeName, recomputeWalletStats(regimeTrades));
+  }
+
+  getWallet(address: string): WalletState | undefined {
+    return this.wallets.get(address.toLowerCase());
+  }
+
+  getAllWallets(): WalletState[] {
+    return Array.from(this.wallets.values());
+  }
+
+  // -----------------------------------------------------------------------
+  // Trade enrichment
+  // -----------------------------------------------------------------------
+
+  /**
+   * Resolves a WalletTransaction's market_id from its token_id by looking
+   * up registered markets. Returns the enriched transaction, or null if
+   * the token_id doesn't match any known market.
+   */
+  resolveWalletTradeMarket(tx: WalletTransaction): WalletTransaction | null {
+    if (tx.market_id) return tx; // already resolved
+
+    for (const market of this.markets.values()) {
+      if (market.tokens.yes_id === tx.token_id || market.tokens.no_id === tx.token_id) {
+        return { ...tx, market_id: market.market_id };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Enriches a WalletTransaction's price from a matching CLOB trade event.
+   * Looks for a trade with the same tx_hash or (token_id, timestamp within 5s).
+   */
+  enrichWalletTradePrice(tx: WalletTransaction, recentTrades: ParsedTrade[]): WalletTransaction {
+    if (tx.price > 0) return tx; // already has price
+
+    // Match by tx_hash first (most reliable)
+    if (tx.tx_hash) {
+      const match = recentTrades.find((t) => t.tx_hash === tx.tx_hash);
+      if (match) return { ...tx, price: match.price };
+    }
+
+    // Match by token_id + timestamp proximity
+    const match = recentTrades.find(
+      (t) =>
+        t.token_id === tx.token_id &&
+        Math.abs(t.timestamp - tx.timestamp) < 5_000,
+    );
+    if (match) return { ...tx, price: match.price };
+
+    return tx;
   }
 
   // -----------------------------------------------------------------------

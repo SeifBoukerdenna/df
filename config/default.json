@@ -219,7 +219,7 @@
     "swing_min_hold_seconds": 3600,
     "swing_min_sharpe": 1.0,
     "noise_max_sharpe": 0.3,
-    "delay_buckets_seconds": [5, 10, 15, 20, 30, 60, 120, 300],
+    "delay_buckets_seconds": [1, 2, 3, 5, 7, 10, 15, 20, 30, 60],
     "min_significance_p": 0.05,
     "recency_window_days": 30
   },

@@ -15,8 +15,9 @@ import { Ledger } from './ledger/ledger.js';
 import { ClobWebSocket } from './ingestion/clob_websocket.js';
 import { BookPoller } from './ingestion/book_poller.js';
 import { MarketMetadataFetcher } from './ingestion/market_metadata.js';
+import { WalletListener } from './ingestion/wallet_listener.js';
 import { reportHealth, reportState, printReport } from './analytics/reports.js';
-import type { IngestionMetrics } from './ingestion/types.js';
+import type { IngestionMetrics, ParsedTrade } from './ingestion/types.js';
 
 const log = getLogger('main');
 
@@ -107,6 +108,23 @@ async function runSystem(): Promise<void> {
     rawEventsDir: config.ingestion.raw_events_dir,
   });
 
+  const walletListener = new WalletListener({
+    rpcUrl: config.polymarket.rpc_url,
+    trackedWallets: config.wallet_intel.tracked_wallets,
+    rawEventsDir: config.ingestion.raw_events_dir,
+    reconnectBaseMs: config.ingestion.ws_reconnect_base_ms,
+    reconnectMaxMs: config.ingestion.ws_reconnect_max_ms,
+  });
+
+  // Register tracked wallets in state
+  for (const addr of config.wallet_intel.tracked_wallets) {
+    state.registerWallet(addr);
+  }
+
+  // Recent CLOB trades buffer for enriching wallet transactions
+  const recentClobTrades: ParsedTrade[] = [];
+  const MAX_RECENT_TRADES = 500;
+
   // ---------------------------------------------------------------------------
   // Event wiring: Ingestion → State → Ledger
   // ---------------------------------------------------------------------------
@@ -155,7 +173,7 @@ async function runSystem(): Promise<void> {
     }
   });
 
-  // Trades from WebSocket → state update + ledger
+  // Trades from WebSocket → state update + recent buffer for wallet enrichment
   clobWs.on('trade', (trade) => {
     const markets = state.getAllMarkets();
     const market = markets.find(
@@ -164,6 +182,13 @@ async function runSystem(): Promise<void> {
     if (market) {
       state.updateMarketFromTrade(trade);
     }
+
+    // Buffer for wallet trade enrichment
+    recentClobTrades.push(trade);
+    if (recentClobTrades.length > MAX_RECENT_TRADES) {
+      recentClobTrades.splice(0, recentClobTrades.length - MAX_RECENT_TRADES);
+    }
+
     log.debug(
       {
         market_id: trade.market_id,
@@ -175,10 +200,53 @@ async function runSystem(): Promise<void> {
     );
   });
 
+  // Wallet trades from chain listener → enrich + state update + ledger
+  walletListener.on('wallet_trade', (tx) => {
+    // Resolve market_id from token_id
+    const resolved = state.resolveWalletTradeMarket(tx);
+    if (!resolved) {
+      log.debug({ token_id: tx.token_id.slice(0, 10) }, 'Wallet trade for unknown token');
+      return;
+    }
+
+    // Enrich price from recent CLOB trades
+    const enriched = state.enrichWalletTradePrice(resolved, recentClobTrades);
+
+    // Update wallet state with running stats
+    state.recordWalletTradeWithRegime(enriched);
+
+    // Log to ledger
+    ledger.append({
+      type: 'system_event',
+      data: {
+        event: 'wallet_trade',
+        details: {
+          wallet: enriched.wallet.slice(0, 10),
+          market_id: enriched.market_id,
+          side: enriched.side,
+          size: enriched.size,
+          price: enriched.price,
+          block: enriched.block_number,
+        },
+      },
+    });
+
+    log.debug(
+      {
+        wallet: enriched.wallet.slice(0, 10),
+        market_id: enriched.market_id,
+        side: enriched.side,
+        size: enriched.size,
+      },
+      'wallet_trade processed',
+    );
+  });
+
   // Error handlers
   clobWs.on('error', (err) => log.warn({ err }, 'ClobWebSocket error'));
   bookPoller.on('error', (err, tokenId) => log.warn({ err, tokenId }, 'BookPoller error'));
   metadataFetcher.on('error', (err) => log.warn({ err }, 'MetadataFetcher error'));
+  walletListener.on('error', (err) => log.warn({ err }, 'WalletListener error'));
 
   // ---------------------------------------------------------------------------
   // Periodic state snapshot
@@ -204,6 +272,7 @@ async function runSystem(): Promise<void> {
     clobWs.stop();
     bookPoller.stop();
     metadataFetcher.stop();
+    walletListener.stop();
 
     clearInterval(snapshotInterval);
 
@@ -229,6 +298,7 @@ async function runSystem(): Promise<void> {
   metadataFetcher.start();
   bookPoller.start();
   clobWs.start();
+  walletListener.start();
 
   log.info('All ingestion components started');
 }
