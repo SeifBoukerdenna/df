@@ -22,11 +22,29 @@ export interface KillCondition {
 }
 
 // ---------------------------------------------------------------------------
-// Decay model — inlined in TradeSignal (function stripped to serialisable form)
+// Decay model — inlined in TradeSignal (serialisable form)
+//
+// The SPEC defines ev_at_t as a function, but since DecayModel must be
+// JSON-serialisable for the ledger, we store the parameters and provide
+// a companion pure function `computeEvAtT`.
 // ---------------------------------------------------------------------------
 
 export interface DecayModel {
   half_life_ms: number;
+  initial_ev: number;
+}
+
+/**
+ * Computes the expected value of a signal at time `tMs` milliseconds after
+ * generation, given exponential decay with the specified half-life.
+ *
+ * ev(t) = initial_ev × 2^(-t / half_life)
+ *       = initial_ev × e^(-ln2 × t / half_life)
+ */
+export function computeEvAtT(decay: DecayModel, tMs: number): number {
+  if (decay.half_life_ms <= 0) return 0;
+  if (tMs <= 0) return decay.initial_ev;
+  return decay.initial_ev * Math.exp(-0.693147 * tMs / decay.half_life_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +337,7 @@ export interface ExperimentResult {
 export type LedgerEntry =
   | { type: 'signal_generated'; data: TradeSignal }
   | { type: 'signal_filtered'; data: { signal_id: string; reason: string; filter: string } }
+  | { type: 'signal_killed'; data: { signal_id: string; strategy_id: string; market_id: string; kill_condition: KillConditionType; threshold: number; actual_value: number; age_ms: number; ev_at_kill: number } }
   | { type: 'portfolio_decision'; data: PortfolioDecision }
   | { type: 'execution_plan'; data: ExecutionPlan }
   | { type: 'order_submitted'; data: { signal_id: string; order_details: object } }

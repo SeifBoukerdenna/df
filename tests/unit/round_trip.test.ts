@@ -62,7 +62,7 @@ function makeSignalEntry(i: number): LedgerEntry {
       reasoning: `Signal reason ${i}`,
       kill_conditions: [{ type: 'time_elapsed', threshold: 30_000 }],
       regime_assumption: 'normal',
-      decay_model: { half_life_ms: 15_000 },
+      decay_model: { half_life_ms: 15_000, initial_ev: 0.03 + (i % 5) * 0.005 },
     },
   };
 }
@@ -246,6 +246,7 @@ describe('Ledger round-trip (100 entries)', () => {
       expect(d.ev_confidence_interval).toHaveLength(2);
       expect(Array.isArray(d.kill_conditions)).toBe(true);
       expect(d.decay_model.half_life_ms).toBe(15_000);
+      expect(typeof d.decay_model.initial_ev).toBe('number');
     }
   });
 
