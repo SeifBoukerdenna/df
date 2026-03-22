@@ -30,11 +30,15 @@ export class MarketMetadataFetcher extends EventEmitter {
   private readonly knownMarkets = new Map<string, MarketMetadata>();
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private readonly minLiquidity: number;
+  private readonly maxMarkets: number;
 
-  constructor(gammaUrl: string, pollIntervalMs: number) {
+  constructor(gammaUrl: string, pollIntervalMs: number, opts?: { minLiquidity?: number; maxMarkets?: number }) {
     super();
     this.gammaUrl = gammaUrl;
     this.pollIntervalMs = pollIntervalMs;
+    this.minLiquidity = opts?.minLiquidity ?? 1000;
+    this.maxMarkets = opts?.maxMarkets ?? 500;
   }
 
   start(): void {
@@ -76,8 +80,9 @@ export class MarketMetadataFetcher extends EventEmitter {
       this.diff(markets);
       this.schedule(this.pollIntervalMs);
     } catch (err) {
-      const delay = Math.min(30_000, this.pollIntervalMs);
+      const delay = Math.min(10_000, this.pollIntervalMs);
       log.warn({ err }, `MarketMetadataFetcher error, retrying in ${delay}ms`);
+      this.emit('error', err as Error);
       this.schedule(delay);
     }
   }
@@ -87,9 +92,14 @@ export class MarketMetadataFetcher extends EventEmitter {
     let offset = 0;
     const limit = 100;
 
+    // Sort by volume descending to get the most liquid markets first.
+    // Cap total pages to avoid fetching 35K+ markets (most are dead/low volume).
+    const maxPages = Math.ceil(this.maxMarkets / limit);
+    let pageCount = 0;
+
     for (;;) {
-      const url = `${this.gammaUrl}/markets?limit=${limit}&offset=${offset}&active=true&closed=false`;
-      const resp = await fetch(url);
+      const url = `${this.gammaUrl}/markets?limit=${limit}&offset=${offset}&active=true&closed=false&order=volume24hr&ascending=false`;
+      const resp = await fetch(url, { signal: AbortSignal.timeout(15_000) });
 
       if (resp.status === 429) {
         const retryAfter = Number(resp.headers.get('retry-after') ?? '5');
@@ -109,14 +119,21 @@ export class MarketMetadataFetcher extends EventEmitter {
         : (data as { data: unknown[] }).data ?? [];
 
       for (const raw of page) {
-        const meta = parseMarket(raw);
+        const meta = parseMarketWithLiquidity(raw, this.minLiquidity);
         if (meta !== null) results.push(meta);
       }
 
-      if (page.length < limit) break;
+      pageCount++;
+      if (page.length < limit || pageCount >= maxPages) break;
       offset += limit;
     }
 
+    log.info({
+      total_markets: results.length,
+      with_tokens: results.filter(m => m.tokens.yes_id && m.tokens.no_id).length,
+      pages_fetched: pageCount,
+      max_markets: this.maxMarkets,
+    }, 'Fetched markets from Gamma API');
     return results;
   }
 
@@ -151,6 +168,17 @@ export class MarketMetadataFetcher extends EventEmitter {
 // Helpers
 // ---------------------------------------------------------------------------
 
+function parseMarketWithLiquidity(raw: unknown, minLiquidity: number): MarketMetadata | null {
+  try {
+    const r = raw as Record<string, unknown>;
+    const liquidity = Number(r['liquidity'] ?? 0);
+    if (liquidity < minLiquidity) return null;
+  } catch {
+    return null;
+  }
+  return parseMarket(raw);
+}
+
 function parseMarket(raw: unknown): MarketMetadata | null {
   try {
     const r = raw as Record<string, unknown>;
@@ -161,12 +189,24 @@ function parseMarket(raw: unknown): MarketMetadata | null {
 
     if (!marketId || !question) return null;
 
-    // Parse tokens
-    const tokensRaw = r['tokens'] as Array<Record<string, unknown>> | undefined;
-    const yesToken = tokensRaw?.find((t) => String(t['outcome']).toUpperCase() === 'YES');
-    const noToken = tokensRaw?.find((t) => String(t['outcome']).toUpperCase() === 'NO');
-    const yesId = String(yesToken?.['token_id'] ?? yesToken?.['tokenId'] ?? '');
-    const noId = String(noToken?.['token_id'] ?? noToken?.['tokenId'] ?? '');
+    // Parse tokens — Gamma API returns clobTokenIds as a JSON-encoded array [yesId, noId]
+    // Fall back to legacy tokens array format if present
+    let yesId = '';
+    let noId = '';
+    const clobTokenIdsRaw = r['clobTokenIds'];
+    if (clobTokenIdsRaw) {
+      const parsed: string[] = typeof clobTokenIdsRaw === 'string'
+        ? (JSON.parse(clobTokenIdsRaw) as string[])
+        : (clobTokenIdsRaw as string[]);
+      yesId = String(parsed[0] ?? '');
+      noId = String(parsed[1] ?? '');
+    } else {
+      const tokensRaw = r['tokens'] as Array<Record<string, unknown>> | undefined;
+      const yesToken = tokensRaw?.find((t) => String(t['outcome']).toUpperCase() === 'YES');
+      const noToken = tokensRaw?.find((t) => String(t['outcome']).toUpperCase() === 'NO');
+      yesId = String(yesToken?.['token_id'] ?? yesToken?.['tokenId'] ?? '');
+      noId = String(noToken?.['token_id'] ?? noToken?.['tokenId'] ?? '');
+    }
 
     const statusRaw = String(r['status'] ?? 'active').toLowerCase();
     const status: 'active' | 'paused' | 'resolved' =

@@ -45,7 +45,12 @@ export class BookPoller extends EventEmitter {
   }
 
   addToken(tokenId: string, marketId: string): void {
+    if (!tokenId) return;
+    const isNew = !this.trackedTokens.has(tokenId);
     this.trackedTokens.set(tokenId, marketId);
+    if (isNew) {
+      log.debug({ tokenId: tokenId.slice(0, 16), marketId }, 'Token added to book poller');
+    }
   }
 
   removeToken(tokenId: string): void {
@@ -59,8 +64,7 @@ export class BookPoller extends EventEmitter {
     this.pollTimer = setInterval(() => {
       void this.pollAll();
     }, this.pollIntervalMs);
-    // Poll immediately
-    void this.pollAll();
+    // Don't poll immediately — no tokens registered yet, MetadataFetcher will add them
   }
 
   stop(): void {
@@ -75,17 +79,31 @@ export class BookPoller extends EventEmitter {
   // Private
   // ---------------------------------------------------------------------------
 
+  // Round-robin index for polling tokens in batches
+  private pollIndex = 0;
+
   private async pollAll(): Promise<void> {
     const tokens = Array.from(this.trackedTokens.entries());
     if (tokens.length === 0) return;
 
+    // Poll a batch of tokens per tick to avoid overwhelming the event loop.
+    // With 500+ tokens and 2s interval, we poll ~20 tokens per tick = full
+    // cycle in ~50 ticks = ~100 seconds. WS provides real-time updates for
+    // the rest, so this is mainly a fallback/reconciliation.
+    const BATCH_SIZE = 20;
+    const start = this.pollIndex;
+    const end = Math.min(start + BATCH_SIZE, tokens.length);
+    const batch = tokens.slice(start, end);
+
+    this.pollIndex = end >= tokens.length ? 0 : end;
+
     const results = await Promise.allSettled(
-      tokens.map(([tokenId, marketId]) => this.fetchBook(tokenId, marketId)),
+      batch.map(([tokenId, marketId]) => this.fetchBook(tokenId, marketId)),
     );
 
     for (let i = 0; i < results.length; i++) {
       const result = results[i]!;
-      const [tokenId] = tokens[i]!;
+      const [tokenId] = batch[i]!;
 
       if (result.status === 'fulfilled') {
         if (result.value !== null) {
@@ -93,17 +111,8 @@ export class BookPoller extends EventEmitter {
           this.emit('book_snapshot', result.value);
         }
       } else {
-        log.warn({ tokenId, reason: result.reason }, 'BookPoller fetch error');
+        log.debug({ tokenId: tokenId.slice(0, 16) }, 'BookPoller fetch error');
         this.emit('error', result.reason as Error, tokenId);
-      }
-    }
-
-    // Stale detection
-    const t = now();
-    for (const [tokenId] of tokens) {
-      const lastAt = this.lastPollAt.get(tokenId);
-      if (lastAt !== undefined && t - lastAt > this.staleThresholdMs) {
-        this.emit('stale', tokenId, t - lastAt);
       }
     }
   }
@@ -172,9 +181,9 @@ function parseBookResponse(
     const spreadBps = mid > 0 ? (spread / mid) * 10_000 : 0;
 
     const bidDepth1pct = bookDepthWithin(bids, bestBid, DEPTH_1PCT);
-    const askDepth1pct = bookDepthWithin(asks, bestAsk, DEPTH_5PCT);
+    const askDepth1pct = bookDepthWithin(asks, bestAsk, DEPTH_1PCT);
     const bidDepth5pct = bookDepthWithin(bids, bestBid, DEPTH_5PCT);
-    const askDepth5pct = bookDepthWithin(asks, bestAsk, DEPTH_1PCT);
+    const askDepth5pct = bookDepthWithin(asks, bestAsk, DEPTH_5PCT);
 
     const vwapBid = vwap(bids, VWAP_SIZE);
     const vwapAsk = vwap(asks, VWAP_SIZE);

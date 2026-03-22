@@ -893,7 +893,7 @@ export function buildEdgeMap(
  * detects reclassifications, and returns events.
  */
 export class MarketClassifier {
-  private readonly classifications: Map<string, MarketClassification> = new Map();
+  readonly classifications: Map<string, MarketClassification> = new Map();
   private readonly observations: Map<string, MarketObservations> = new Map();
   private measuredLatencyP50Ms: number;
 

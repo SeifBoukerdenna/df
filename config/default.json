@@ -7,7 +7,7 @@
     "gamma_url": "https://gamma-api.polymarket.com",
     "fee_rate": 0.02,
     "chain_id": 137,
-    "rpc_url": "wss://polygon-mainnet.g.alchemy.com/v2/EcRCiNAXJXzC22dzlU1gc"
+    "rpc_url": ""
   },
 
   "ingestion": {
@@ -19,7 +19,9 @@
     "ws_reconnect_max_ms": 60000,
     "dedup_cache_ttl_ms": 60000,
     "stale_data_threshold_ms": 5000,
-    "raw_events_dir": "data/raw_events"
+    "raw_events_dir": "data/raw_events",
+    "min_market_liquidity": 1000,
+    "max_markets": 500
   },
 
   "state": {

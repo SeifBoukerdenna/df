@@ -287,6 +287,10 @@ async function runSystem(): Promise<void> {
   const metadataFetcher = new MarketMetadataFetcher(
     config.polymarket.gamma_url,
     config.ingestion.metadata_poll_interval_ms,
+    {
+      minLiquidity: config.ingestion.min_market_liquidity,
+      maxMarkets: config.ingestion.max_markets,
+    },
   );
 
   const bookPoller = new BookPoller(
@@ -406,6 +410,12 @@ async function runSystem(): Promise<void> {
   const recentClobTrades: ParsedTrade[] = [];
   const MAX_RECENT_TRADES = 500;
 
+  // Token ID → market_id index for O(1) lookups instead of O(n) scans per event
+  const tokenToMarketId = new Map<string, string>();
+
+  // Flag: set when markets are loaded, triggers initial classification in next strategy tick
+  let needsInitialClassification = false;
+
   // ---------------------------------------------------------------------------
   // Event wiring: Ingestion → State → Ledger
   // ---------------------------------------------------------------------------
@@ -414,15 +424,32 @@ async function runSystem(): Promise<void> {
   metadataFetcher.on('market_created', (meta) => {
     state.registerMarket(meta);
 
-    // Register both YES and NO tokens with the book poller
-    if (meta.tokens.yes_id) bookPoller.addToken(meta.tokens.yes_id, meta.market_id);
-    if (meta.tokens.no_id) bookPoller.addToken(meta.tokens.no_id, meta.market_id);
+    // Register both YES and NO tokens with the book poller, WebSocket, and index
+    const tokenIds: string[] = [];
+    if (meta.tokens.yes_id) {
+      bookPoller.addToken(meta.tokens.yes_id, meta.market_id);
+      tokenIds.push(meta.tokens.yes_id);
+      tokenToMarketId.set(meta.tokens.yes_id, meta.market_id);
+    }
+    if (meta.tokens.no_id) {
+      bookPoller.addToken(meta.tokens.no_id, meta.market_id);
+      tokenIds.push(meta.tokens.no_id);
+      tokenToMarketId.set(meta.tokens.no_id, meta.market_id);
+    }
+
+    // Subscribe ClobWebSocket to the new tokens for real-time trades/price updates
+    if (tokenIds.length > 0) {
+      clobWs.subscribeAssets(tokenIds);
+    }
 
     // Feed new market event to regime detector
     state.regimeDetector.recordNewMarket(now());
 
     ledger.append({ type: 'system_event', data: { event: 'market_created', details: meta } });
     log.info({ market_id: meta.market_id, question: meta.question }, 'Market registered');
+
+    // Trigger initial classification once we have enough markets
+    needsInitialClassification = true;
   });
 
   metadataFetcher.on('market_resolved', (meta) => {
@@ -438,11 +465,11 @@ async function runSystem(): Promise<void> {
 
   // Book snapshots from REST poller → state update + classifier observations + propagation
   bookPoller.on('book_snapshot', (snapshot) => {
-    const markets = state.getAllMarkets();
-    const market = markets.find(
-      (m) => m.tokens.yes_id === snapshot.token_id || m.tokens.no_id === snapshot.token_id,
-    );
+    const marketId = tokenToMarketId.get(snapshot.token_id);
+    const market = marketId ? state.getMarket(marketId) : undefined;
     if (market) {
+      // Ensure market_id matches state key (Gamma API id, not condition_id)
+      snapshot.market_id = market.market_id;
       state.updateMarket(snapshot);
       // Keep ClobWebSocket's pre-trade book state in sync
       clobWs.updateBookSnapshot(snapshot);
@@ -468,11 +495,11 @@ async function runSystem(): Promise<void> {
 
   // Book snapshots from WebSocket → state update + classifier + propagation
   clobWs.on('book_snapshot', (snapshot) => {
-    const markets = state.getAllMarkets();
-    const market = markets.find(
-      (m) => m.tokens.yes_id === snapshot.token_id || m.tokens.no_id === snapshot.token_id,
-    );
+    const marketId = tokenToMarketId.get(snapshot.token_id);
+    const market = marketId ? state.getMarket(marketId) : undefined;
     if (market) {
+      // WS sends condition_id as market, but state keys by Gamma API id
+      snapshot.market_id = market.market_id;
       state.updateMarket(snapshot);
 
       // Feed book update to classifier observations
@@ -491,11 +518,11 @@ async function runSystem(): Promise<void> {
 
   // Trades from WebSocket → state update + classifier observations + wallet buffer
   clobWs.on('trade', (trade) => {
-    const markets = state.getAllMarkets();
-    const market = markets.find(
-      (m) => m.tokens.yes_id === trade.token_id || m.tokens.no_id === trade.token_id,
-    );
+    const marketId = tokenToMarketId.get(trade.token_id);
+    const market = marketId ? state.getMarket(marketId) : undefined;
     if (market) {
+      // Fix market_id from WS (condition_id) to Gamma API id
+      trade.market_id = market.market_id;
       state.updateMarketFromTrade(trade);
 
       // Feed trade to classifier observations
@@ -570,10 +597,10 @@ async function runSystem(): Promise<void> {
   walletListener.on('error', (err) => log.warn({ err }, 'WalletListener error'));
 
   // ---------------------------------------------------------------------------
-  // Periodic market classification (every 60s)
+  // Periodic market classification (every 60s, with initial run after 15s)
   // ---------------------------------------------------------------------------
 
-  const classifyInterval = setInterval(() => {
+  const runClassification = () => {
     try {
       const events = marketClassifier.classifyAll(state.markets, 'scheduled');
       for (const evt of events) {
@@ -582,13 +609,33 @@ async function runSystem(): Promise<void> {
           data: { event: 'market_reclassified', details: evt },
         });
       }
-      log.debug(
-        { markets: state.markets.size, reclassified: events.length },
+      const classified = marketClassifier.classifications.size;
+      const edgeMap = marketClassifier.buildEdgeMap(
+        config.risk.max_total_exposure_pct * 10_000,
+      );
+      log.info(
+        {
+          markets: state.markets.size,
+          classified,
+          reclassified: events.length,
+          markets_with_edge: edgeMap.markets_with_edge.length,
+        },
         'Market classification tick',
       );
     } catch (err) {
       log.warn({ err }, 'Market classification failed');
     }
+  };
+
+  // Periodic classification + initial classification triggered by market loading
+  let initialClassificationDone = false;
+
+  const classifyInterval = setInterval(() => {
+    // On first interval, check if initial classification was missed
+    if (!initialClassificationDone && state.markets.size > 0) {
+      initialClassificationDone = true;
+    }
+    runClassification();
   }, 60_000);
   classifyInterval.unref();
 
@@ -634,7 +681,8 @@ async function runSystem(): Promise<void> {
 
   const snapshotInterval = setInterval(() => {
     try {
-      state.saveToDisk(config.state.snapshots_dir);
+      const snapshotFile = `${config.state.snapshots_dir}/state-${Date.now()}.json`;
+      state.saveToDisk(snapshotFile);
       propagationModel.saveStatsSnapshot();
       log.debug('State snapshot saved');
     } catch (err) {
@@ -647,8 +695,19 @@ async function runSystem(): Promise<void> {
   // Strategy engine tick: evaluate all strategies every 5s
   // ---------------------------------------------------------------------------
 
+  let strategyTickCount = 0;
   const strategyTickInterval = setInterval(() => {
     try {
+      strategyTickCount++;
+
+      // Run initial classification if markets have been loaded but not yet classified
+      if (needsInitialClassification && !initialClassificationDone && state.markets.size >= 10) {
+        initialClassificationDone = true;
+        needsInitialClassification = false;
+        log.info({ markets: state.markets.size }, 'Running initial market classification');
+        runClassification();
+      }
+
       // Build edge map from classifier
       const edgeMap = marketClassifier.buildEdgeMap(
         config.risk.max_total_exposure_pct * 10_000, // total capital estimate
@@ -656,15 +715,21 @@ async function runSystem(): Promise<void> {
 
       const result = strategyEngine.tick(state, edgeMap, marketClassifier);
 
+      // Log every tick (not just when signals are generated) for diagnostics
+      log.info(
+        {
+          tick: strategyTickCount,
+          edge_markets: edgeMap.markets_with_edge.length,
+          evaluated: result.markets_evaluated,
+          strategies_run: result.strategies_run,
+          generated: result.signals_generated.length,
+          filtered: result.signals_filtered.length,
+          elapsed_ms: result.elapsed_ms.toFixed(1),
+        },
+        'Strategy tick',
+      );
+
       if (result.signals_generated.length > 0) {
-        log.info(
-          {
-            generated: result.signals_generated.length,
-            filtered: result.signals_filtered.length,
-            markets: result.markets_evaluated,
-          },
-          'Strategy tick produced signals',
-        );
 
         // Paper execution for each signal
         if (config.paper_mode) {
@@ -739,7 +804,8 @@ async function runSystem(): Promise<void> {
     propagationModel.saveStatsSnapshot();
 
     try {
-      state.saveToDisk(config.state.snapshots_dir);
+      const snapshotFile = `${config.state.snapshots_dir}/state-${Date.now()}.json`;
+      state.saveToDisk(snapshotFile);
       log.info('Final state snapshot saved');
     } catch (err) {
       log.warn({ err }, 'Failed to save final state snapshot');
@@ -762,6 +828,41 @@ async function runSystem(): Promise<void> {
   clobWs.start();
   walletListener.start();
   state.startRegimeDetection();
+
+  // ---------------------------------------------------------------------------
+  // Periodic data flow diagnostics (every 30s for first 5 minutes)
+  // ---------------------------------------------------------------------------
+
+  let diagCount = 0;
+  const diagInterval = setInterval(() => {
+    diagCount++;
+    const markets = state.getAllMarkets();
+    const marketsWithBooks = markets.filter(m =>
+      m.book.yes.mid > 0 || m.book.no.mid > 0
+    ).length;
+    const marketsWithTrades = markets.filter(m =>
+      m.last_trade_price.yes > 0 || m.last_trade_price.no > 0
+    ).length;
+
+    log.info({
+      total_markets: markets.length,
+      markets_with_books: marketsWithBooks,
+      markets_with_trades: marketsWithTrades,
+      clob_ws_events: clobWs.metrics.events_received,
+      clob_ws_eps: Math.round(clobWs.metrics.events_per_second * 100) / 100,
+      clob_ws_parse_errors: clobWs.metrics.parse_errors,
+      clob_ws_reconnects: clobWs.metrics.reconnect_count,
+      wallets_tracked: config.wallet_intel.tracked_wallets.length,
+      strategy_ticks: strategyTickCount,
+      open_positions: reconciliation.getOpenPositions().length,
+    }, 'Data flow diagnostics');
+
+    // Stop diagnostics after 5 minutes (10 ticks at 30s)
+    if (diagCount >= 10) {
+      clearInterval(diagInterval);
+    }
+  }, 30_000);
+  diagInterval.unref();
 
   log.info('All ingestion components started (regime detection every 60s)');
 }

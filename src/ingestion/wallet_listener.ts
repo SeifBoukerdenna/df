@@ -145,6 +145,12 @@ export class WalletListener extends EventEmitter {
 
   start(): void {
     if (this.running) return;
+
+    if (!this.rpcUrl || !this.rpcUrl.startsWith('wss://')) {
+      log.warn('WalletListener disabled: no valid wss:// RPC URL configured');
+      return;
+    }
+
     this.running = true;
 
     if (this.trackedWallets.size === 0) {

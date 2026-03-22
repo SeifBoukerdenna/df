@@ -1,9 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { config as dotenvConfig } from 'dotenv';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const CONFIG_DIR = resolve(__dirname, '..', '..', 'config');
+const PROJECT_ROOT = resolve(__dirname, '..', '..');
+const CONFIG_DIR = resolve(PROJECT_ROOT, 'config');
+
+// Load .env from project root
+dotenvConfig({ path: resolve(PROJECT_ROOT, '.env') });
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,6 +33,8 @@ export interface IngestionConfig {
   dedup_cache_ttl_ms: number;
   stale_data_threshold_ms: number;
   raw_events_dir: string;
+  min_market_liquidity: number;
+  max_markets: number;
 }
 
 export interface StateConfig {
@@ -181,6 +188,9 @@ export interface Config {
     private_key: string | null;
     api_key: string | null;
     api_secret: string | null;
+    api_passphrase: string | null;
+    relayer_api_key: string | null;
+    wallet_address: string | null;
   };
 }
 
@@ -299,11 +309,20 @@ function loadConfig(): Config {
   const config = merged as unknown as Config;
 
   // Secrets come exclusively from env vars — never from config files.
+  // Supports both POLYMARKET_* env vars and .env-style keys (apiKey, secret, passphrase).
   config.secrets = {
     private_key: process.env['POLYMARKET_PRIVATE_KEY'] ?? null,
-    api_key: process.env['POLYMARKET_API_KEY'] ?? null,
-    api_secret: process.env['POLYMARKET_API_SECRET'] ?? null,
+    api_key: process.env['POLYMARKET_API_KEY'] ?? process.env['apiKey'] ?? null,
+    api_secret: process.env['POLYMARKET_API_SECRET'] ?? process.env['secret'] ?? null,
+    api_passphrase: process.env['POLYMARKET_API_PASSPHRASE'] ?? process.env['passphrase'] ?? null,
+    relayer_api_key: process.env['relayer_api_key'] ?? null,
+    wallet_address: process.env['adress'] ?? process.env['POLYMARKET_WALLET_ADDRESS'] ?? null,
   };
+
+  // Auto-add wallet address to tracked wallets if not already present
+  if (config.secrets.wallet_address && !config.wallet_intel.tracked_wallets.includes(config.secrets.wallet_address)) {
+    config.wallet_intel.tracked_wallets.push(config.secrets.wallet_address);
+  }
 
   return config;
 }
