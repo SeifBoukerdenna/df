@@ -1,10 +1,17 @@
 /**
  * Entry point for the Polymarket Quantitative Trading Platform.
  *
- * Wires together: Ingestion → State → Ledger
- * CLI: `quant report health` and `quant report state`
+ * Architecture (multi-threaded):
+ *   Main thread:  Ingestion (WS, REST, metadata) — never blocked by computation
+ *   Worker thread: Strategy engine, classification, consistency, features
+ *
+ * Communication: Main → Worker (events), Worker → Main (signals)
+ * Book updates are batched (500ms flush) to avoid message port saturation.
  */
 
+import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { program } from 'commander';
 import { config as cfg } from './utils/config.js';
 import type { Config } from './utils/config.js';
@@ -35,29 +42,13 @@ import {
   reportAttribution,
   parsePeriod,
 } from './counterfactual/attribution.js';
-import { FeatureEngine } from './research/feature_engine.js';
-import { MarketClassifier, recordBookUpdate, recordTrade, recordComplementGap } from './analytics/market_classifier.js';
+import { MarketClassifier } from './analytics/market_classifier.js';
 import { ConsistencyChecker } from './analytics/consistency_checker.js';
 import { PropagationModel } from './analytics/propagation_model.js';
-import { StrategyEngine } from './strategy/engine.js';
-import { WalletFollowStrategy } from './strategy/wallet_follow.js';
-import { ComplementArbStrategy } from './strategy/complement_arb.js';
-import { BookImbalanceStrategy } from './strategy/book_imbalance.js';
-import { LargeTradeReactionStrategy } from './strategy/large_trade_reaction.js';
-import { StaleBookStrategy } from './strategy/stale_book.js';
-import { CrossMarketConsistencyStrategy } from './strategy/cross_market_consistency.js';
-import { MicropriceDislocationStrategy } from './strategy/microprice_dislocation.js';
 import { paperExecute } from './execution/executor.js';
 import { Reconciliation } from './execution/reconciliation.js';
-import { scoreWallet } from './wallet_intel/scorer.js';
-import { classifyWallet } from './wallet_intel/classifier.js';
-import { computeWalletDelayCurve } from './wallet_intel/delay_analysis.js';
-import { computeWalletRegimeProfile } from './wallet_intel/regime_conditional.js';
-import { buildRegimeSpans } from './wallet_intel/regime_conditional.js';
-import type { WalletIntelProvider } from './strategy/wallet_follow.js';
-import type { PriceTimeseries } from './wallet_intel/types.js';
-import type { IngestionMetrics, ParsedTrade } from './ingestion/types.js';
-import type { ConsistencyCheck } from './analytics/types.js';
+import type { IngestionMetrics, ParsedTrade, ParsedBookSnapshot } from './ingestion/types.js';
+import type { MainToWorkerMessage, WorkerToMainMessage } from './workers/messages.js';
 
 const log = getLogger('main');
 
@@ -265,25 +256,123 @@ async function runSystem(): Promise<void> {
   const config = cfg;
   const startedAt = now();
 
-  log.info({ paper_mode: config.paper_mode }, 'Starting Polymarket Quant Platform');
+  log.info({ paper_mode: config.paper_mode, threaded: true }, 'Starting Polymarket Quant Platform');
 
-  // Core components
+  // Core components (main thread: ingestion + lightweight state for WS book sync)
   const state = new WorldState();
   const ledger = new Ledger(config.ledger.dir);
+  const reconciliation = new Reconciliation(ledger);
 
-  // Analytics: market classification, consistency, propagation
-  const marketClassifier = new MarketClassifier(
-    config.strategies.wallet_follow['default_latency_ms'] as number ?? 2000,
-  );
-  const consistencyChecker = new ConsistencyChecker(config.polymarket.fee_rate);
-  const propagationModel = new PropagationModel(
-    config.strategies.wallet_follow['default_latency_ms'] as number ?? 2000,
-  );
+  // ---------------------------------------------------------------------------
+  // Computation Worker Thread
+  // ---------------------------------------------------------------------------
 
-  // Last consistency check results (shared with featureEngine)
-  let lastConsistencyChecks: ConsistencyCheck[] = [];
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  const workerPath = join(__dirname, 'workers', 'computation_worker.js');
 
-  // Ingestion
+  const worker = new Worker(workerPath);
+
+  // Worker message helper with type safety
+  function sendToWorker(msg: MainToWorkerMessage): void {
+    worker.postMessage(msg);
+  }
+
+  // Book update batching: collect snapshots and flush every 500ms to avoid
+  // saturating the worker's message port with 1500+ individual messages/sec.
+  const FLUSH_INTERVAL_MS = 500;
+  let pendingBookUpdates: ParsedBookSnapshot[] = [];
+
+  const flushTimer = setInterval(() => {
+    if (pendingBookUpdates.length > 0) {
+      sendToWorker({ type: 'book_update_batch', data: pendingBookUpdates });
+      pendingBookUpdates = [];
+    }
+  }, FLUSH_INTERVAL_MS);
+
+  // Initialize worker with config
+  sendToWorker({
+    type: 'init',
+    config: {
+      paper_mode: config.paper_mode,
+      fee_rate: config.polymarket.fee_rate,
+      default_latency_ms: config.strategies.wallet_follow['default_latency_ms'] as number ?? 2000,
+      max_total_exposure_pct: config.risk.max_total_exposure_pct,
+      features_dir: config.features.dir,
+      features_capture_interval_ms: config.features.capture_interval_ms,
+      tracked_wallets: config.wallet_intel.tracked_wallets,
+      strategies: config.strategies as unknown as Record<string, unknown>,
+    },
+  });
+
+  // Handle worker messages (signals, diagnostics)
+  let workerStrategyTicks = 0;
+  let workerSignalsTotal = 0;
+  let workerMarketsWithEdge = 0;
+  worker.on('message', (msg: WorkerToMainMessage) => {
+    switch (msg.type) {
+      case 'ready':
+        log.info('Computation worker ready');
+        break;
+
+      case 'signal_generated':
+        workerSignalsTotal++;
+        log.info(
+          {
+            signal_id: msg.data.signal_id,
+            strategy: msg.data.strategy_id,
+            market: msg.data.market_id,
+            direction: msg.data.direction,
+            ev: msg.data.ev_estimate,
+          },
+          'Signal received from worker',
+        );
+
+        // Paper execution on main thread (needs live state for fill simulation)
+        if (config.paper_mode) {
+          try {
+            const fillResult = paperExecute(msg.data, state, ledger, {
+              fee_rate: config.polymarket.fee_rate,
+              paper_mode: true,
+            });
+            if (fillResult.filled) {
+              reconciliation.openPosition(fillResult.execution, msg.data.ev_estimate);
+            }
+          } catch (err) {
+            log.warn({ err, signal_id: msg.data.signal_id }, 'Paper execution failed');
+          }
+        }
+        break;
+
+      case 'signal_filtered':
+        // Already logged to ledger by worker
+        break;
+
+      case 'classification_done':
+        workerMarketsWithEdge = msg.data.markets_with_edge;
+        log.info(msg.data, 'Classification complete (worker)');
+        break;
+
+      case 'diagnostics':
+        workerStrategyTicks = msg.data.strategy_ticks;
+        break;
+    }
+  });
+
+  worker.on('error', (err) => {
+    log.error({ err }, 'Computation worker error');
+  });
+
+  worker.on('exit', (code) => {
+    if (code !== 0) {
+      log.error({ code }, 'Computation worker exited unexpectedly');
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Ingestion components (main thread only — never blocked by computation)
+  // ---------------------------------------------------------------------------
+
   const metadataFetcher = new MarketMetadataFetcher(
     config.polymarket.gamma_url,
     config.ingestion.metadata_poll_interval_ms,
@@ -315,116 +404,22 @@ async function runSystem(): Promise<void> {
     reconnectMaxMs: config.ingestion.ws_reconnect_max_ms,
   });
 
-  // Register tracked wallets in state
-  for (const addr of config.wallet_intel.tracked_wallets) {
-    state.registerWallet(addr);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Regime detection: 60s interval, logs changes to ledger
-  // ---------------------------------------------------------------------------
-
-  state.onRegimeChange = (from, to, confidence) => {
-    ledger.append({ type: 'regime_change', data: { from, to, confidence } });
-    log.info({ from, to, confidence }, 'Regime change logged to ledger');
-  };
-
-  // ---------------------------------------------------------------------------
-  // Feature extraction engine: captures all features every 60s
-  // ---------------------------------------------------------------------------
-
-  const featureEngine = new FeatureEngine({
-    outputDir: config.features.dir,
-    minVolume24h: 1000,
-    captureIntervalMs: config.features.capture_interval_ms,
-  });
-
-  featureEngine.start(() => ({
-    markets: state.getAllMarkets(),
-    wallets: state.getAllWallets(),
-    regime: state.regime,
-    consistencyViolations: lastConsistencyChecks,
-    marketGraph: state.market_graph,
-  }));
-
-  // ---------------------------------------------------------------------------
-  // Strategy Engine: register all 7 strategies in shadow mode
-  // ---------------------------------------------------------------------------
-
-  const strategyEngine = new StrategyEngine(ledger);
-  const reconciliation = new Reconciliation(ledger);
-
-  // Build WalletIntelProvider adapter
-  // Price history for delay curve computation (built from market state snapshots)
-  const priceHistory: Map<string, PriceTimeseries> = new Map();
-
-  const walletIntelProvider: WalletIntelProvider = {
-    getScore(address: string) {
-      const walletState = state.getWallet(address);
-      if (!walletState) return null;
-      const classification = classifyWallet(walletState);
-      const delayCurve = computeWalletDelayCurve(walletState, priceHistory);
-      const regimeSpans = buildRegimeSpans([{
-        timestamp: state.regime.regime_since,
-        regime: state.regime.current_regime,
-      }]);
-      const regimeProfile = computeWalletRegimeProfile(walletState, regimeSpans);
-      return scoreWallet({
-        wallet: walletState,
-        classification,
-        delayCurve,
-        regimeProfile,
-      });
-    },
-    getDelayCurve(address: string) {
-      const walletState = state.getWallet(address);
-      if (!walletState) return null;
-      return computeWalletDelayCurve(walletState, priceHistory);
-    },
-    getRegimeProfile(address: string) {
-      const walletState = state.getWallet(address);
-      if (!walletState) return null;
-      const regimeSpans = buildRegimeSpans([{
-        timestamp: state.regime.regime_since,
-        regime: state.regime.current_regime,
-      }]);
-      return computeWalletRegimeProfile(walletState, regimeSpans);
-    },
-  };
-
-  // Register strategies
-  strategyEngine.register(new WalletFollowStrategy(walletIntelProvider));
-  strategyEngine.register(new ComplementArbStrategy());
-  strategyEngine.register(new BookImbalanceStrategy());
-  strategyEngine.register(new LargeTradeReactionStrategy());
-  strategyEngine.register(new StaleBookStrategy(propagationModel));
-  strategyEngine.register(new CrossMarketConsistencyStrategy(consistencyChecker));
-  strategyEngine.register(new MicropriceDislocationStrategy());
-
-  log.info(
-    { strategies: strategyEngine.registeredIds(), paper_mode: config.paper_mode },
-    'All strategies registered in shadow mode',
-  );
+  // Token ID → market_id index for O(1) lookups
+  const tokenToMarketId = new Map<string, string>();
 
   // Recent CLOB trades buffer for enriching wallet transactions
   const recentClobTrades: ParsedTrade[] = [];
   const MAX_RECENT_TRADES = 500;
 
-  // Token ID → market_id index for O(1) lookups instead of O(n) scans per event
-  const tokenToMarketId = new Map<string, string>();
-
-  // Flag: set when markets are loaded, triggers initial classification in next strategy tick
-  let needsInitialClassification = false;
-
   // ---------------------------------------------------------------------------
-  // Event wiring: Ingestion → State → Ledger
+  // Event wiring: Ingestion → State (local) + Worker (forwarded)
   // ---------------------------------------------------------------------------
 
-  // Market metadata: register new markets, update book poller token list
   metadataFetcher.on('market_created', (meta) => {
+    // Local state (for book sync, wallet resolution, state snapshots)
     state.registerMarket(meta);
 
-    // Register both YES and NO tokens with the book poller, WebSocket, and index
+    // Token registration
     const tokenIds: string[] = [];
     if (meta.tokens.yes_id) {
       bookPoller.addToken(meta.tokens.yes_id, meta.market_id);
@@ -437,133 +432,68 @@ async function runSystem(): Promise<void> {
       tokenToMarketId.set(meta.tokens.no_id, meta.market_id);
     }
 
-    // Subscribe ClobWebSocket to the new tokens for real-time trades/price updates
     if (tokenIds.length > 0) {
       clobWs.subscribeAssets(tokenIds);
     }
 
-    // Feed new market event to regime detector
-    state.regimeDetector.recordNewMarket(now());
+    // Forward to worker
+    sendToWorker({ type: 'market_registered', data: meta });
 
     ledger.append({ type: 'system_event', data: { event: 'market_created', details: meta } });
     log.info({ market_id: meta.market_id, question: meta.question }, 'Market registered');
-
-    // Trigger initial classification once we have enough markets
-    needsInitialClassification = true;
   });
 
   metadataFetcher.on('market_resolved', (meta) => {
-    // Feed resolution event to regime detector
-    state.regimeDetector.recordResolution(now());
-
+    sendToWorker({ type: 'market_resolved', data: meta });
     ledger.append({ type: 'system_event', data: { event: 'market_resolved', details: meta } });
-    log.info(
-      { market_id: meta.market_id, resolution: meta.resolution },
-      'Market resolved',
-    );
+    log.info({ market_id: meta.market_id, resolution: meta.resolution }, 'Market resolved');
   });
 
-  // Book snapshots from REST poller → state update + classifier observations + propagation
+  // Book snapshots from REST poller → local state + batch to worker
   bookPoller.on('book_snapshot', (snapshot) => {
     const marketId = tokenToMarketId.get(snapshot.token_id);
-    const market = marketId ? state.getMarket(marketId) : undefined;
-    if (market) {
-      // Ensure market_id matches state key (Gamma API id, not condition_id)
-      snapshot.market_id = market.market_id;
+    if (marketId) {
+      snapshot.market_id = marketId;
       state.updateMarket(snapshot);
-      // Keep ClobWebSocket's pre-trade book state in sync
       clobWs.updateBookSnapshot(snapshot);
-
-      // Feed book update to market classifier observations
-      const side = market.tokens.yes_id === snapshot.token_id ? 'yes' : 'no';
-      const updatedMarket = state.getMarket(market.market_id);
-      if (updatedMarket) {
-        const obs = marketClassifier.getObservations(market.market_id);
-        recordBookUpdate(obs, updatedMarket, side);
-
-        // Record complement gap
-        if (updatedMarket.complement_gap_executable !== 0) {
-          recordComplementGap(obs, snapshot.timestamp, Math.abs(updatedMarket.complement_gap_executable), config.polymarket.fee_rate);
-        }
-
-        // Feed mid-price to propagation model
-        const mid = side === 'yes' ? updatedMarket.book.yes.mid : updatedMarket.book.no.mid;
-        propagationModel.onPriceUpdate(market.market_id, mid, snapshot.timestamp, state.market_graph);
-      }
+      pendingBookUpdates.push(snapshot);
     }
   });
 
-  // Book snapshots from WebSocket → state update + classifier + propagation
+  // Book snapshots from WebSocket → local state + batch to worker
   clobWs.on('book_snapshot', (snapshot) => {
     const marketId = tokenToMarketId.get(snapshot.token_id);
-    const market = marketId ? state.getMarket(marketId) : undefined;
-    if (market) {
-      // WS sends condition_id as market, but state keys by Gamma API id
-      snapshot.market_id = market.market_id;
+    if (marketId) {
+      snapshot.market_id = marketId;
       state.updateMarket(snapshot);
-
-      // Feed book update to classifier observations
-      const side = market.tokens.yes_id === snapshot.token_id ? 'yes' : 'no';
-      const updatedMarket = state.getMarket(market.market_id);
-      if (updatedMarket) {
-        const obs = marketClassifier.getObservations(market.market_id);
-        recordBookUpdate(obs, updatedMarket, side);
-
-        // Feed mid-price to propagation model
-        const mid = side === 'yes' ? updatedMarket.book.yes.mid : updatedMarket.book.no.mid;
-        propagationModel.onPriceUpdate(market.market_id, mid, snapshot.timestamp, state.market_graph);
-      }
+      pendingBookUpdates.push(snapshot);
     }
   });
 
-  // Trades from WebSocket → state update + classifier observations + wallet buffer
+  // Trades from WebSocket → local state + forward to worker
   clobWs.on('trade', (trade) => {
     const marketId = tokenToMarketId.get(trade.token_id);
-    const market = marketId ? state.getMarket(marketId) : undefined;
-    if (market) {
-      // Fix market_id from WS (condition_id) to Gamma API id
-      trade.market_id = market.market_id;
+    if (marketId) {
+      trade.market_id = marketId;
       state.updateMarketFromTrade(trade);
-
-      // Feed trade to classifier observations
-      const obs = marketClassifier.getObservations(market.market_id);
-      const sizeUsd = trade.price * trade.size;
-      recordTrade(obs, trade.timestamp, sizeUsd, trade.maker ?? '', trade.taker ?? '', null);
+      sendToWorker({ type: 'trade', data: trade });
     }
 
-    // Buffer for wallet trade enrichment
     recentClobTrades.push(trade);
     if (recentClobTrades.length > MAX_RECENT_TRADES) {
       recentClobTrades.splice(0, recentClobTrades.length - MAX_RECENT_TRADES);
     }
-
-    log.debug(
-      {
-        market_id: trade.market_id,
-        side: trade.side,
-        price: trade.price,
-        size: trade.size,
-      },
-      'trade',
-    );
   });
 
-  // Wallet trades from chain listener → enrich + state update + ledger
+  // Wallet trades → local enrichment + forward to worker
   walletListener.on('wallet_trade', (tx) => {
-    // Resolve market_id from token_id
     const resolved = state.resolveWalletTradeMarket(tx);
-    if (!resolved) {
-      log.debug({ token_id: tx.token_id.slice(0, 10) }, 'Wallet trade for unknown token');
-      return;
-    }
+    if (!resolved) return;
 
-    // Enrich price from recent CLOB trades
     const enriched = state.enrichWalletTradePrice(resolved, recentClobTrades);
-
-    // Update wallet state with running stats
     state.recordWalletTradeWithRegime(enriched);
+    sendToWorker({ type: 'wallet_trade', data: enriched });
 
-    // Log to ledger
     ledger.append({
       type: 'system_event',
       data: {
@@ -578,16 +508,6 @@ async function runSystem(): Promise<void> {
         },
       },
     });
-
-    log.debug(
-      {
-        wallet: enriched.wallet.slice(0, 10),
-        market_id: enriched.market_id,
-        side: enriched.side,
-        size: enriched.size,
-      },
-      'wallet_trade processed',
-    );
   });
 
   // Error handlers
@@ -597,94 +517,13 @@ async function runSystem(): Promise<void> {
   walletListener.on('error', (err) => log.warn({ err }, 'WalletListener error'));
 
   // ---------------------------------------------------------------------------
-  // Periodic market classification (every 60s, with initial run after 15s)
-  // ---------------------------------------------------------------------------
-
-  const runClassification = () => {
-    try {
-      const events = marketClassifier.classifyAll(state.markets, 'scheduled');
-      for (const evt of events) {
-        ledger.append({
-          type: 'system_event',
-          data: { event: 'market_reclassified', details: evt },
-        });
-      }
-      const classified = marketClassifier.classifications.size;
-      const edgeMap = marketClassifier.buildEdgeMap(
-        config.risk.max_total_exposure_pct * 10_000,
-      );
-      log.info(
-        {
-          markets: state.markets.size,
-          classified,
-          reclassified: events.length,
-          markets_with_edge: edgeMap.markets_with_edge.length,
-        },
-        'Market classification tick',
-      );
-    } catch (err) {
-      log.warn({ err }, 'Market classification failed');
-    }
-  };
-
-  // Periodic classification + initial classification triggered by market loading
-  let initialClassificationDone = false;
-
-  const classifyInterval = setInterval(() => {
-    // On first interval, check if initial classification was missed
-    if (!initialClassificationDone && state.markets.size > 0) {
-      initialClassificationDone = true;
-    }
-    runClassification();
-  }, 60_000);
-  classifyInterval.unref();
-
-  // ---------------------------------------------------------------------------
-  // Periodic consistency check (every 60s)
-  // ---------------------------------------------------------------------------
-
-  const consistencyInterval = setInterval(() => {
-    try {
-      const checks = consistencyChecker.checkAll(state.markets, state.market_graph);
-      lastConsistencyChecks = checks;
-
-      const tradeable = checks.filter((c) => c.tradeable);
-      if (tradeable.length > 0) {
-        log.info(
-          { total: checks.length, tradeable: tradeable.length },
-          'Consistency violations detected',
-        );
-        ledger.append({
-          type: 'system_event',
-          data: {
-            event: 'consistency_violations',
-            details: {
-              total: checks.length,
-              tradeable: tradeable.length,
-              total_executable_profit: tradeable.reduce(
-                (s, c) => s + c.executable_violation,
-                0,
-              ),
-            },
-          },
-        });
-      }
-    } catch (err) {
-      log.warn({ err }, 'Consistency check failed');
-    }
-  }, 60_000);
-  consistencyInterval.unref();
-
-  // ---------------------------------------------------------------------------
-  // Periodic state snapshot
+  // State snapshots (main thread, every 5 min)
   // ---------------------------------------------------------------------------
 
   const snapshotInterval = setInterval(() => {
     try {
       const snapshotFile = `${config.state.snapshots_dir}/state-${Date.now()}.json`;
       state.saveToDisk(snapshotFile);
-      propagationModel.saveStatsSnapshot();
-      log.debug('State snapshot saved');
     } catch (err) {
       log.warn({ err }, 'Failed to save state snapshot');
     }
@@ -692,84 +531,7 @@ async function runSystem(): Promise<void> {
   snapshotInterval.unref();
 
   // ---------------------------------------------------------------------------
-  // Strategy engine tick: evaluate all strategies every 5s
-  // ---------------------------------------------------------------------------
-
-  let strategyTickCount = 0;
-  const strategyTickInterval = setInterval(() => {
-    try {
-      strategyTickCount++;
-
-      // Run initial classification if markets have been loaded but not yet classified
-      if (needsInitialClassification && !initialClassificationDone && state.markets.size >= 10) {
-        initialClassificationDone = true;
-        needsInitialClassification = false;
-        log.info({ markets: state.markets.size }, 'Running initial market classification');
-        runClassification();
-      }
-
-      // Build edge map from classifier
-      const edgeMap = marketClassifier.buildEdgeMap(
-        config.risk.max_total_exposure_pct * 10_000, // total capital estimate
-      );
-
-      const result = strategyEngine.tick(state, edgeMap, marketClassifier);
-
-      // Log every tick (not just when signals are generated) for diagnostics
-      log.info(
-        {
-          tick: strategyTickCount,
-          edge_markets: edgeMap.markets_with_edge.length,
-          evaluated: result.markets_evaluated,
-          strategies_run: result.strategies_run,
-          generated: result.signals_generated.length,
-          filtered: result.signals_filtered.length,
-          elapsed_ms: result.elapsed_ms.toFixed(1),
-        },
-        'Strategy tick',
-      );
-
-      if (result.signals_generated.length > 0) {
-
-        // Paper execution for each signal
-        if (config.paper_mode) {
-          for (const signal of result.signals_generated) {
-            const fillResult = paperExecute(signal, state, ledger, {
-              fee_rate: config.polymarket.fee_rate,
-              paper_mode: true,
-            });
-
-            if (fillResult.filled) {
-              reconciliation.openPosition(fillResult.execution, signal.ev_estimate);
-              strategyEngine.trackSignal(signal);
-            }
-          }
-        }
-      }
-
-      // Check kill conditions on live signals
-      const killed = strategyEngine.checkKillConditions(state);
-      for (const k of killed) {
-        // Close positions for killed signals
-        for (const pos of reconciliation.getOpenPositions()) {
-          if (pos.market_id === k.signal.market_id && pos.strategy_id === k.signal.strategy_id) {
-            const market = state.markets.get(pos.market_id);
-            if (market) {
-              const isYes = market.tokens.yes_id === pos.token_id;
-              const exitPrice = isYes ? market.book.yes.mid : market.book.no.mid;
-              reconciliation.closePosition(pos.position_id, exitPrice);
-            }
-          }
-        }
-      }
-    } catch (err) {
-      log.warn({ err }, 'Strategy tick failed');
-    }
-  }, 5_000);
-  strategyTickInterval.unref();
-
-  // ---------------------------------------------------------------------------
-  // Mark-to-market: update position PnL every 10s
+  // Mark-to-market: update position PnL every 10s (main thread, needs state)
   // ---------------------------------------------------------------------------
 
   const mtmInterval = setInterval(() => {
@@ -792,16 +554,13 @@ async function runSystem(): Promise<void> {
     bookPoller.stop();
     metadataFetcher.stop();
     walletListener.stop();
-    state.stopRegimeDetection();
-    featureEngine.stop();
 
-    clearInterval(classifyInterval);
-    clearInterval(consistencyInterval);
+    clearInterval(flushTimer);
     clearInterval(snapshotInterval);
-    clearInterval(strategyTickInterval);
     clearInterval(mtmInterval);
 
-    propagationModel.saveStatsSnapshot();
+    // Terminate worker
+    worker.terminate().catch(() => {});
 
     try {
       const snapshotFile = `${config.state.snapshots_dir}/state-${Date.now()}.json`;
@@ -820,17 +579,16 @@ async function runSystem(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   // ---------------------------------------------------------------------------
-  // Start
+  // Start ingestion
   // ---------------------------------------------------------------------------
 
   metadataFetcher.start();
   bookPoller.start();
   clobWs.start();
   walletListener.start();
-  state.startRegimeDetection();
 
   // ---------------------------------------------------------------------------
-  // Periodic data flow diagnostics (every 30s for first 5 minutes)
+  // Periodic diagnostics (every 30s for first 5 minutes)
   // ---------------------------------------------------------------------------
 
   let diagCount = 0;
@@ -838,10 +596,10 @@ async function runSystem(): Promise<void> {
     diagCount++;
     const markets = state.getAllMarkets();
     const marketsWithBooks = markets.filter(m =>
-      m.book.yes.mid > 0 || m.book.no.mid > 0
+      m.book.yes.mid > 0 || m.book.no.mid > 0,
     ).length;
     const marketsWithTrades = markets.filter(m =>
-      m.last_trade_price.yes > 0 || m.last_trade_price.no > 0
+      m.last_trade_price.yes > 0 || m.last_trade_price.no > 0,
     ).length;
 
     log.info({
@@ -850,21 +608,20 @@ async function runSystem(): Promise<void> {
       markets_with_trades: marketsWithTrades,
       clob_ws_events: clobWs.metrics.events_received,
       clob_ws_eps: Math.round(clobWs.metrics.events_per_second * 100) / 100,
-      clob_ws_parse_errors: clobWs.metrics.parse_errors,
-      clob_ws_reconnects: clobWs.metrics.reconnect_count,
-      wallets_tracked: config.wallet_intel.tracked_wallets.length,
-      strategy_ticks: strategyTickCount,
+      // Worker stats
+      worker_strategy_ticks: workerStrategyTicks,
+      worker_signals_total: workerSignalsTotal,
+      worker_markets_with_edge: workerMarketsWithEdge,
       open_positions: reconciliation.getOpenPositions().length,
     }, 'Data flow diagnostics');
 
-    // Stop diagnostics after 5 minutes (10 ticks at 30s)
     if (diagCount >= 10) {
       clearInterval(diagInterval);
     }
   }, 30_000);
   diagInterval.unref();
 
-  log.info('All ingestion components started (regime detection every 60s)');
+  log.info('Main thread: ingestion started. Worker thread: computation started.');
 }
 
 // ---------------------------------------------------------------------------
