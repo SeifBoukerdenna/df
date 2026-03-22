@@ -322,17 +322,19 @@ async function runSystem(): Promise<void> {
         log.info('Computation worker ready');
         break;
 
-      case 'signal_generated':
+      case 'signal_generated': {
         workerSignalsTotal++;
+        const sigMarket = state.getMarket(msg.data.market_id)?.question ?? msg.data.market_id;
+        const evStr = (msg.data.ev_estimate * 100).toFixed(1);
         log.info(
           {
             signal_id: msg.data.signal_id,
             strategy: msg.data.strategy_id,
-            market: msg.data.market_id,
             direction: msg.data.direction,
             ev: msg.data.ev_estimate,
+            market: sigMarket,
           },
-          'Signal received from worker',
+          `signal_generated | ${msg.data.direction} EV=${evStr}¢ — ${sigMarket}`,
         );
 
         // Paper execution on main thread (needs live state for fill simulation)
@@ -350,6 +352,7 @@ async function runSystem(): Promise<void> {
           }
         }
         break;
+      }
 
       case 'signal_filtered':
         // Already logged to ledger by worker
@@ -492,26 +495,70 @@ async function runSystem(): Promise<void> {
     }
   });
 
+  // Token IDs that have already been queued for on-demand lookup (avoid duplicate calls)
+  const pendingTokenLookups = new Set<string>();
+
   // Wallet trades → local enrichment + forward to worker
   walletListener.on('wallet_trade', (tx) => {
     const resolved = state.resolveWalletTradeMarket(tx);
-    if (!resolved) return;
+    if (!resolved) {
+      // Token not in state — try on-demand Gamma API lookup
+      if (!pendingTokenLookups.has(tx.token_id)) {
+        pendingTokenLookups.add(tx.token_id);
+        log.info(
+          { wallet: tx.wallet, side: tx.side },
+          'wallet_trade | new market — discovering...',
+        );
+        metadataFetcher.lookupByTokenId(tx.token_id).then((meta) => {
+          if (!meta) {
+            log.warn({ token_id: tx.token_id.slice(0, 20) }, 'wallet_trade | market lookup failed, trade dropped');
+          }
+          // market_created event will fire automatically via metadataFetcher.emit(),
+          // which will register it in state for future trades
+        }).catch(() => { /* logged inside lookupByTokenId */ });
+      }
+      return;
+    }
 
     const enriched = state.enrichWalletTradePrice(resolved, recentClobTrades);
     state.recordWalletTradeWithRegime(enriched);
     sendToWorker({ type: 'wallet_trade', data: enriched });
+
+    const mkt = state.getMarket(enriched.market_id);
+    const marketQuestion = mkt?.question ?? enriched.market_id;
+
+    // If CLOB trade didn't match, fall back to book mid for the correct side
+    let displayPrice = enriched.price;
+    if (displayPrice <= 0 && mkt) {
+      const side = mkt.tokens.yes_id === enriched.token_id ? 'yes' : 'no';
+      displayPrice = mkt.book[side].mid;
+    }
+    const priceStr = displayPrice > 0 ? `@ $${displayPrice.toFixed(3)} (est)` : '@ price unknown';
+    const walletShort = enriched.wallet.slice(0, 6) + '…' + enriched.wallet.slice(-4);
+    log.info(
+      {
+        wallet: enriched.wallet,
+        side: enriched.side,
+        size: enriched.size.toFixed(1),
+        price: displayPrice > 0 ? displayPrice : undefined,
+        market: marketQuestion,
+      },
+      `wallet_trade | [${walletShort}] ${enriched.side} ${enriched.size.toFixed(1)} shares ${priceStr} — ${marketQuestion}`,
+    );
 
     ledger.append({
       type: 'system_event',
       data: {
         event: 'wallet_trade',
         details: {
-          wallet: enriched.wallet.slice(0, 10),
+          wallet: enriched.wallet,
+          token_id: enriched.token_id,
           market_id: enriched.market_id,
           side: enriched.side,
           size: enriched.size,
           price: enriched.price,
           block: enriched.block_number,
+          ingested_at: enriched.timestamp,
         },
       },
     });

@@ -92,6 +92,14 @@ export class WalletFollowStrategy implements Strategy {
 
   private readonly intel: WalletIntelProvider;
 
+  /**
+   * Tracks positions we've paper-opened this session: `${wallet}:${market_id}:${token_id}`.
+   * Only set when we emit a BUY signal. Used to block orphan SELL signals for
+   * positions the wallet opened before we started tracking (we never bought it,
+   * so we can't sell it).
+   */
+  private readonly sessionOpenedPositions = new Set<string>();
+
   constructor(intel: WalletIntelProvider) {
     this.intel = intel;
   }
@@ -208,6 +216,18 @@ export class WalletFollowStrategy implements Strategy {
           ? (walletDirection === 'BUY' ? 'SELL' : 'BUY')
           : walletDirection;
 
+        // Guard: only emit a SELL if we paper-opened the position this session.
+        // If the wallet bought BEFORE we started tracking, we never entered —
+        // selling something we don't own is meaningless.
+        const positionKey = `${walletState.address}:${market.market_id}:${trade.token_id}`;
+        if (signalDirection === 'SELL' && !this.sessionOpenedPositions.has(positionKey)) {
+          log.debug(
+            { wallet: walletState.address.slice(0, 10), market_id: market.market_id },
+            'Wallet follow: skipping SELL — no matching BUY in this session',
+          );
+          continue;
+        }
+
         // Target price: book mid on the relevant side
         const targetPrice = book.mid;
         const maxPrice = signalDirection === 'BUY'
@@ -270,6 +290,11 @@ export class WalletFollowStrategy implements Strategy {
         };
 
         signals.push(signal);
+
+        // Record this session-opened position so a future SELL is permitted
+        if (signalDirection === 'BUY') {
+          this.sessionOpenedPositions.add(positionKey);
+        }
 
         // --- Tracking metrics ---
         log.info({

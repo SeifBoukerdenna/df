@@ -75,6 +75,58 @@ export class MarketMetadataFetcher extends EventEmitter {
     return this.knownMarkets;
   }
 
+  /**
+   * On-demand lookup: given a token_id (on-chain asset_id) that isn't in state,
+   * query the Gamma API to find which market it belongs to.
+   * Returns the MarketMetadata and emits market_created if found.
+   * Returns null if not found or already known.
+   */
+  async lookupByTokenId(tokenId: string): Promise<MarketMetadata | null> {
+    const basePath = new URL(this.gammaUrl).pathname;
+    const path = `${basePath}/markets?clob_token_ids=${encodeURIComponent(tokenId)}&limit=1`;
+
+    try {
+      const { statusCode, body } = await this.pool.request({
+        method: 'GET',
+        path,
+        headers: { accept: 'application/json' },
+        headersTimeout: 10_000,
+        bodyTimeout: 10_000,
+      });
+
+      if (statusCode < 200 || statusCode >= 300) {
+        await body.dump();
+        return null;
+      }
+
+      const data = (await body.json()) as unknown;
+      const page: unknown[] = Array.isArray(data)
+        ? (data as unknown[])
+        : (data as { data: unknown[] }).data ?? [];
+
+      if (page.length === 0) return null;
+
+      const meta = parseMarket(page[0]);
+      if (!meta) return null;
+
+      // Register as known and emit market_created (bypasses liquidity filter —
+      // we want to track any market a tracked wallet is actually trading)
+      if (!this.knownMarkets.has(meta.market_id)) {
+        this.knownMarkets.set(meta.market_id, meta);
+        log.info(
+          { market_id: meta.market_id, question: meta.question, token_id: tokenId.slice(0, 20) },
+          'market_discovered_via_wallet_trade',
+        );
+        this.emit('market_created', meta);
+      }
+
+      return meta;
+    } catch (err) {
+      log.debug({ err, token_id: tokenId.slice(0, 20) }, 'Token lookup failed');
+      return null;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Private
   // ---------------------------------------------------------------------------
