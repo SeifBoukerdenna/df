@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { Pool } from 'undici';
 import { now } from '../utils/time.js';
 import { getLogger } from '../utils/logger.js';
 import type { MarketMetadata } from './types.js';
@@ -32,6 +33,7 @@ export class MarketMetadataFetcher extends EventEmitter {
   private running = false;
   private readonly minLiquidity: number;
   private readonly maxMarkets: number;
+  private readonly pool: Pool;
 
   constructor(gammaUrl: string, pollIntervalMs: number, opts?: { minLiquidity?: number; maxMarkets?: number }) {
     super();
@@ -39,6 +41,17 @@ export class MarketMetadataFetcher extends EventEmitter {
     this.pollIntervalMs = pollIntervalMs;
     this.minLiquidity = opts?.minLiquidity ?? 1000;
     this.maxMarkets = opts?.maxMarkets ?? 500;
+
+    const url = new URL(gammaUrl);
+    this.pool = new Pool(`${url.protocol}//${url.host}`, {
+      connections: 2,
+      pipelining: 1,
+      // Keep connections alive longer than the poll interval so we don't burn
+      // a new TCP connection (and leave one in TIME_WAIT) on every metadata poll.
+      keepAliveTimeout: Math.max(pollIntervalMs * 1.5, 90_000),
+      keepAliveMaxTimeout: Math.max(pollIntervalMs * 2, 120_000),
+      connect: { timeout: 15_000 },
+    });
   }
 
   start(): void {
@@ -54,6 +67,7 @@ export class MarketMetadataFetcher extends EventEmitter {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
+    void this.pool.destroy();
     log.info('MarketMetadataFetcher stopped');
   }
 
@@ -96,22 +110,49 @@ export class MarketMetadataFetcher extends EventEmitter {
     // Cap total pages to avoid fetching 35K+ markets (most are dead/low volume).
     const maxPages = Math.ceil(this.maxMarkets / limit);
     let pageCount = 0;
+    const basePath = new URL(this.gammaUrl).pathname;
 
     for (;;) {
-      const url = `${this.gammaUrl}/markets?limit=${limit}&offset=${offset}&active=true&closed=false&order=volume24hr&ascending=false`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      const path = `${basePath}/markets?limit=${limit}&offset=${offset}&active=true&closed=false&order=volume24hr&ascending=false`;
 
-      if (resp.status === 429) {
-        const retryAfter = Number(resp.headers.get('retry-after') ?? '5');
+      // Retry each page up to 3 times on transient connection errors (ECONNRESET,
+      // EADDRNOTAVAIL) before propagating to the top-level poll() error handler.
+      const resp = await (async () => {
+        for (let attempt = 0; ; attempt++) {
+          try {
+            return await this.pool.request({
+              method: 'GET',
+              path,
+              headers: { accept: 'application/json' },
+              headersTimeout: 15_000,
+              bodyTimeout: 15_000,
+            });
+          } catch (err) {
+            if (attempt < 3) {
+              log.debug({ attempt: attempt + 1, offset, err }, 'Gamma API page fetch transient error, retrying');
+              await sleep(500 * Math.pow(2, attempt));
+              continue;
+            }
+            throw err; // exhausted retries — propagate to poll()
+          }
+        }
+      })();
+
+      const { statusCode, body, headers } = resp;
+
+      if (statusCode === 429) {
+        const retryAfter = Number((headers as Record<string, string>)['retry-after'] ?? '5');
+        await body.dump();
         await sleep(retryAfter * 1000);
         continue;
       }
 
-      if (!resp.ok) {
-        throw new Error(`Gamma API HTTP ${resp.status}: ${resp.statusText}`);
+      if (statusCode < 200 || statusCode >= 300) {
+        await body.dump();
+        throw new Error(`Gamma API HTTP ${statusCode}`);
       }
 
-      const data = (await resp.json()) as unknown;
+      const data = (await body.json()) as unknown;
 
       // Gamma API may return array directly or {data: [...]}
       const page: unknown[] = Array.isArray(data)

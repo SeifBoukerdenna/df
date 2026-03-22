@@ -122,7 +122,7 @@
       "signal_half_life_ms": 120000
     },
     "complement_arb": {
-      "enabled": true,
+      "enabled": false,
       "paper_only": true,
       "capital_allocation": 0.30,
       "max_position_size": 1000,
@@ -136,7 +136,7 @@
       "signal_half_life_ms": 10000
     },
     "book_imbalance": {
-      "enabled": true,
+      "enabled": false,
       "paper_only": true,
       "capital_allocation": 0.15,
       "max_position_size": 300,
@@ -152,7 +152,7 @@
       "signal_half_life_ms": 60000
     },
     "large_trade_reaction": {
-      "enabled": true,
+      "enabled": false,
       "paper_only": true,
       "capital_allocation": 0.10,
       "max_position_size": 200,
@@ -166,7 +166,7 @@
       "signal_half_life_ms": 60000
     },
     "stale_book": {
-      "enabled": true,
+      "enabled": false,
       "paper_only": true,
       "capital_allocation": 0.10,
       "max_position_size": 200,
@@ -180,7 +180,7 @@
       "signal_half_life_ms": 15000
     },
     "cross_market_consistency": {
-      "enabled": true,
+      "enabled": false,
       "paper_only": true,
       "capital_allocation": 0.05,
       "max_position_size": 500,
@@ -193,7 +193,7 @@
       "signal_half_life_ms": 300000
     },
     "microprice_dislocation": {
-      "enabled": true,
+      "enabled": false,
       "paper_only": true,
       "capital_allocation": 0.05,
       "max_position_size": 100,
@@ -215,7 +215,20 @@
   },
 
   "wallet_intel": {
-    "tracked_wallets": [],
+    "tracked_wallets": [
+      "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+      "0xdc876e6873772d38716fda7f2452a78d426d7ab6",
+      "0x15ceffed7bf820cd2d90f90ea24ae9909f5cd5fa",
+      "0x297fbd45782af37d899015aebbc52437f3d55103",
+      "0x20ad75e19b155f8518eb9e0486158f9884879c9a",
+      "0x87650b9f63563f7c456d9bbcceee5f9faf06ed81",
+      "0xb0f85baa97990910a3e8ac2b4a58a322f01ecef5",
+      "0xb10047d6a254b2ebb306d7a7d13bf59171ab6461",
+      "0xf5fe759cece500f58a431ef8dacea321f6e3e23d",
+      "0xd0d6053c3c37e727402d84c14069780d360993aa",
+      "0x154794795d978c5890b3f69264311f0bd966d066",
+      "0x7177a7f5c216809c577c50c77b12aae81f81ddef"
+    ],
     "classification_min_trades": 30,
     "sniper_max_hold_seconds": 300,
     "swing_min_hold_seconds": 3600,

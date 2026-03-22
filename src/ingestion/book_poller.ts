@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { Pool } from 'undici';
 import { now } from '../utils/time.js';
 import { getLogger } from '../utils/logger.js';
 import { vwap, bookDepthWithin } from '../utils/math.js';
@@ -26,7 +27,8 @@ export interface BookPollerEvents {
 
 /**
  * Polls the Polymarket CLOB REST API for order book snapshots.
- * Polls all registered token IDs concurrently via Promise.allSettled.
+ * Uses a single POST /books batch request per tick via a persistent undici
+ * connection pool — no per-request TCP handshakes, no port exhaustion.
  * Computes full derived fields: depth, VWAP, microprice.
  */
 export class BookPoller extends EventEmitter {
@@ -35,6 +37,7 @@ export class BookPoller extends EventEmitter {
   private readonly staleThresholdMs: number;
   private readonly trackedTokens = new Map<string, string>(); // tokenId → marketId
   private readonly lastPollAt = new Map<string, number>();
+  private readonly pool: Pool;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(clobRestUrl: string, pollIntervalMs: number, staleThresholdMs = 5_000) {
@@ -42,6 +45,18 @@ export class BookPoller extends EventEmitter {
     this.clobRestUrl = clobRestUrl;
     this.pollIntervalMs = pollIntervalMs;
     this.staleThresholdMs = staleThresholdMs;
+
+    // Persistent connection pool to the CLOB host — reuses TCP/TLS connections
+    // across all poll requests, eliminating per-request handshake cost and
+    // TIME_WAIT port exhaustion.
+    const url = new URL(clobRestUrl);
+    this.pool = new Pool(`${url.protocol}//${url.host}`, {
+      connections: 4,          // 4 persistent connections is plenty for 1 req/tick
+      pipelining: 1,
+      keepAliveTimeout: 30_000,
+      keepAliveMaxTimeout: 60_000,
+      connect: { timeout: 10_000 },
+    });
   }
 
   addToken(tokenId: string, marketId: string): void {
@@ -72,6 +87,7 @@ export class BookPoller extends EventEmitter {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    void this.pool.destroy();
     log.info('BookPoller stopped');
   }
 
@@ -121,39 +137,48 @@ export class BookPoller extends EventEmitter {
     tokenIds: string[],
     attempt = 0,
   ): Promise<unknown[] | null> {
-    const url = `${this.clobRestUrl}/books`;
+    const urlObj = new URL(this.clobRestUrl);
+    const path = `${urlObj.pathname}/books`.replace('//', '/');
+    const body = JSON.stringify(tokenIds.map((id) => ({ token_id: id })));
 
     try {
-      const resp = await fetch(url, {
+      const { statusCode, body: responseBody, headers } = await this.pool.request({
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token_ids: tokenIds }),
+        path,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body)),
+        },
+        body,
       });
 
-      if (resp.status === 429) {
-        const retryAfter = Number(resp.headers.get('retry-after') ?? '2');
+      if (statusCode === 429) {
+        const retryAfter = Number(headers['retry-after'] ?? '2');
         if (attempt < 3) {
           await sleep(retryAfter * 1000);
           return this.fetchBooks(tokenIds, attempt + 1);
         }
+        await responseBody.dump();
         const err = new Error('Rate limited after retries');
         log.debug({ count: tokenIds.length }, 'BookPoller batch rate limited');
         this.emit('error', err, `batch(${tokenIds.length} tokens)`);
         return null;
       }
 
-      if (!resp.ok) {
+      if (statusCode < 200 || statusCode >= 300) {
         if (attempt < 3) {
+          await responseBody.dump();
           await sleep(500 * Math.pow(2, attempt));
           return this.fetchBooks(tokenIds, attempt + 1);
         }
-        const err = new Error(`HTTP ${resp.status}`);
-        log.debug({ count: tokenIds.length, status: resp.status }, 'BookPoller batch fetch error');
+        const text = await responseBody.text().catch(() => '');
+        const err = new Error(`HTTP ${statusCode}`);
+        log.debug({ count: tokenIds.length, status: statusCode, body: text.slice(0, 200) }, 'BookPoller batch fetch error');
         this.emit('error', err, `batch(${tokenIds.length} tokens)`);
         return null;
       }
 
-      return (await resp.json()) as unknown[];
+      return (await responseBody.json()) as unknown[];
     } catch (err) {
       if (attempt < 3) {
         await sleep(500 * Math.pow(2, attempt));

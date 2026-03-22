@@ -308,6 +308,11 @@ function loadConfig(): Config {
 
   const config = merged as unknown as Config;
 
+  // RPC URL may contain an API key — load from env if set, fall back to config file.
+  if (process.env['POLYMARKET_RPC_URL']) {
+    config.polymarket.rpc_url = process.env['POLYMARKET_RPC_URL'];
+  }
+
   // Secrets come exclusively from env vars — never from config files.
   // Supports both POLYMARKET_* env vars and .env-style keys (apiKey, secret, passphrase).
   config.secrets = {

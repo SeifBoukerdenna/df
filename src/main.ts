@@ -269,9 +269,16 @@ async function runSystem(): Promise<void> {
 
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);
-  const workerPath = join(__dirname, 'workers', 'computation_worker.js');
 
-  const worker = new Worker(workerPath);
+  // When running via `tsx` (dev mode), import.meta.url ends with .ts.
+  // In that case use the .ts worker path and register the tsx loader so the
+  // worker thread can also execute TypeScript directly.
+  const isTsx = __filename.endsWith('.ts');
+  const workerExt = isTsx ? '.ts' : '.js';
+  const workerPath = join(__dirname, 'workers', `computation_worker${workerExt}`);
+  const workerOptions = isTsx ? { execArgv: ['--import', 'tsx'] } : {};
+
+  const worker = new Worker(workerPath, workerOptions);
 
   // Worker message helper with type safety
   function sendToWorker(msg: MainToWorkerMessage): void {
