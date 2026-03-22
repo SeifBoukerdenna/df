@@ -17,7 +17,7 @@ const VWAP_SIZE = 1000;
 export interface BookPollerEvents {
   book_snapshot: [snapshot: ParsedBookSnapshot];
   stale: [tokenId: string, ageMs: number];
-  error: [err: Error, tokenId: string];
+  error: [err: Error, context: string];
 }
 
 // ---------------------------------------------------------------------------
@@ -86,72 +86,82 @@ export class BookPoller extends EventEmitter {
     const tokens = Array.from(this.trackedTokens.entries());
     if (tokens.length === 0) return;
 
-    // Poll a batch of tokens per tick to avoid overwhelming the event loop.
-    // With 500+ tokens and 2s interval, we poll ~20 tokens per tick = full
-    // cycle in ~50 ticks = ~100 seconds. WS provides real-time updates for
-    // the rest, so this is mainly a fallback/reconciliation.
-    const BATCH_SIZE = 20;
+    // With 500+ tokens and batch_size=100, we make 1 POST /books request per tick
+    // instead of 20 parallel GET /book requests.
+    // Full cycle over 1000 tokens = 10 ticks × interval = fast cold-start warm-up.
+    const BATCH_SIZE = 100;
     const start = this.pollIndex;
     const end = Math.min(start + BATCH_SIZE, tokens.length);
     const batch = tokens.slice(start, end);
 
     this.pollIndex = end >= tokens.length ? 0 : end;
 
-    const results = await Promise.allSettled(
-      batch.map(([tokenId, marketId]) => this.fetchBook(tokenId, marketId)),
-    );
+    const tokenIds = batch.map(([tokenId]) => tokenId);
+    const books = await this.fetchBooks(tokenIds);
 
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i]!;
-      const [tokenId] = batch[i]!;
+    if (books === null) return;
 
-      if (result.status === 'fulfilled') {
-        if (result.value !== null) {
-          this.lastPollAt.set(tokenId, now());
-          this.emit('book_snapshot', result.value);
-        }
-      } else {
-        log.debug({ tokenId: tokenId.slice(0, 16) }, 'BookPoller fetch error');
-        this.emit('error', result.reason as Error, tokenId);
+    for (const bookData of books) {
+      const r = bookData as Record<string, unknown>;
+      const assetId = r['asset_id'] as string | undefined;
+      if (!assetId) continue;
+
+      const marketId = this.trackedTokens.get(assetId);
+      if (!marketId) continue;
+
+      const snapshot = parseBookResponse(bookData, assetId, marketId);
+      if (snapshot !== null) {
+        this.lastPollAt.set(assetId, now());
+        this.emit('book_snapshot', snapshot);
       }
     }
   }
 
-  private async fetchBook(
-    tokenId: string,
-    marketId: string,
+  private async fetchBooks(
+    tokenIds: string[],
     attempt = 0,
-  ): Promise<ParsedBookSnapshot | null> {
-    const url = `${this.clobRestUrl}/book?token_id=${encodeURIComponent(tokenId)}`;
+  ): Promise<unknown[] | null> {
+    const url = `${this.clobRestUrl}/books`;
 
     try {
-      const resp = await fetch(url);
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token_ids: tokenIds }),
+      });
 
       if (resp.status === 429) {
         const retryAfter = Number(resp.headers.get('retry-after') ?? '2');
         if (attempt < 3) {
           await sleep(retryAfter * 1000);
-          return this.fetchBook(tokenId, marketId, attempt + 1);
+          return this.fetchBooks(tokenIds, attempt + 1);
         }
-        throw new Error('Rate limited after retries');
+        const err = new Error('Rate limited after retries');
+        log.debug({ count: tokenIds.length }, 'BookPoller batch rate limited');
+        this.emit('error', err, `batch(${tokenIds.length} tokens)`);
+        return null;
       }
 
       if (!resp.ok) {
         if (attempt < 3) {
           await sleep(500 * Math.pow(2, attempt));
-          return this.fetchBook(tokenId, marketId, attempt + 1);
+          return this.fetchBooks(tokenIds, attempt + 1);
         }
-        throw new Error(`HTTP ${resp.status}`);
+        const err = new Error(`HTTP ${resp.status}`);
+        log.debug({ count: tokenIds.length, status: resp.status }, 'BookPoller batch fetch error');
+        this.emit('error', err, `batch(${tokenIds.length} tokens)`);
+        return null;
       }
 
-      const data = (await resp.json()) as unknown;
-      return parseBookResponse(data, tokenId, marketId);
+      return (await resp.json()) as unknown[];
     } catch (err) {
       if (attempt < 3) {
         await sleep(500 * Math.pow(2, attempt));
-        return this.fetchBook(tokenId, marketId, attempt + 1);
+        return this.fetchBooks(tokenIds, attempt + 1);
       }
-      throw err;
+      log.debug({ count: tokenIds.length }, 'BookPoller batch fetch error');
+      this.emit('error', err as Error, `batch(${tokenIds.length} tokens)`);
+      return null;
     }
   }
 }

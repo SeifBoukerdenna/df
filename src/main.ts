@@ -512,7 +512,7 @@ async function runSystem(): Promise<void> {
 
   // Error handlers
   clobWs.on('error', (err) => log.warn({ err }, 'ClobWebSocket error'));
-  bookPoller.on('error', (err, tokenId) => log.warn({ err, tokenId }, 'BookPoller error'));
+  bookPoller.on('error', (err, context) => log.warn({ err, context }, 'BookPoller error'));
   metadataFetcher.on('error', (err) => log.warn({ err }, 'MetadataFetcher error'));
   walletListener.on('error', (err) => log.warn({ err }, 'WalletListener error'));
 
