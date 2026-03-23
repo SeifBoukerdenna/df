@@ -79,6 +79,9 @@ export class WorldState implements IWorldState {
   regime: RegimeState;
   system_clock: number;
 
+  /** token_id → market_id index for O(1) market lookups */
+  private tokenToMarket: Map<string, string> = new Map();
+
   /** The regime detector instance — available for event recording and inspection */
   readonly regimeDetector: RegimeDetector;
 
@@ -151,7 +154,11 @@ export class WorldState implements IWorldState {
   /** Registers a market from metadata. No-op if already registered. */
   registerMarket(metadata: MarketMetadata): void {
     if (this.markets.has(metadata.market_id)) return;
-    this.markets.set(metadata.market_id, createEmptyMarketState(metadata));
+    const marketState = createEmptyMarketState(metadata);
+    this.markets.set(metadata.market_id, marketState);
+    // Maintain token→market index for O(1) lookups
+    if (marketState.tokens.yes_id) this.tokenToMarket.set(marketState.tokens.yes_id, metadata.market_id);
+    if (marketState.tokens.no_id) this.tokenToMarket.set(marketState.tokens.no_id, metadata.market_id);
   }
 
   // -----------------------------------------------------------------------
@@ -214,6 +221,11 @@ export class WorldState implements IWorldState {
     }
 
     wallet.trades.push(tx);
+    // Cap trades array to last 500 per wallet to bound recomputeWalletStats cost
+    const MAX_WALLET_TRADES = 500;
+    if (wallet.trades.length > MAX_WALLET_TRADES) {
+      wallet.trades = wallet.trades.slice(-MAX_WALLET_TRADES);
+    }
     wallet.stats = recomputeWalletStats(wallet.trades);
     this.system_clock = now();
   }
@@ -259,18 +271,16 @@ export class WorldState implements IWorldState {
   resolveWalletTradeMarket(tx: WalletTransaction): WalletTransaction | null {
     if (tx.market_id) return tx; // already resolved
 
-    for (const market of this.markets.values()) {
-      if (market.tokens.yes_id === tx.token_id || market.tokens.no_id === tx.token_id) {
-        return { ...tx, market_id: market.market_id };
-      }
-    }
+    // O(1) lookup via token→market index
+    const marketId = this.tokenToMarket.get(tx.token_id);
+    if (marketId) return { ...tx, market_id: marketId };
 
     return null;
   }
 
   /**
    * Enriches a WalletTransaction's price from a matching CLOB trade event.
-   * Looks for a trade with the same tx_hash or (token_id, timestamp within 5s).
+   * Tries tx_hash match first, then closest token_id+timestamp match within 15s.
    */
   enrichWalletTradePrice(tx: WalletTransaction, recentTrades: ParsedTrade[]): WalletTransaction {
     if (tx.price > 0) return tx; // already has price
@@ -281,13 +291,24 @@ export class WorldState implements IWorldState {
       if (match) return { ...tx, price: match.price };
     }
 
-    // Match by token_id + timestamp proximity
-    const match = recentTrades.find(
-      (t) =>
-        t.token_id === tx.token_id &&
-        Math.abs(t.timestamp - tx.timestamp) < 5_000,
-    );
-    if (match) return { ...tx, price: match.price };
+    // Match by token_id + closest timestamp within 30s
+    // (Alchemy fires ~4-10s after CLOB for the same trade)
+    // Prefer matches with similar size (within 20%) for disambiguation
+    let bestMatch: ParsedTrade | null = null;
+    let bestScore = Infinity;
+    for (const t of recentTrades) {
+      if (t.token_id !== tx.token_id) continue;
+      const delta = Math.abs(t.timestamp - tx.timestamp);
+      if (delta > 30_000) continue;
+      // Score: lower is better. Exact size match weighs heavily.
+      const sizeRatio = tx.size > 0 ? Math.abs(t.size - tx.size) / tx.size : 0;
+      const score = delta + (sizeRatio > 0.2 ? 10_000 : 0); // penalize size mismatch
+      if (score < bestScore) {
+        bestMatch = t;
+        bestScore = score;
+      }
+    }
+    if (bestMatch) return { ...tx, price: bestMatch.price };
 
     return tx;
   }
@@ -348,6 +369,13 @@ export class WorldState implements IWorldState {
     this.market_graph = (revived['market_graph'] as MarketGraph) ?? { edges: new Map(), clusters: [] };
     this.regime = (revived['regime'] as RegimeState) ?? detectRegime();
     this.system_clock = (revived['system_clock'] as number) ?? now();
+
+    // Rebuild token→market index from loaded markets
+    this.tokenToMarket.clear();
+    for (const market of this.markets.values()) {
+      if (market.tokens.yes_id) this.tokenToMarket.set(market.tokens.yes_id, market.market_id);
+      if (market.tokens.no_id) this.tokenToMarket.set(market.tokens.no_id, market.market_id);
+    }
 
     log.info({ filePath, markets: this.markets.size }, 'State restored from snapshot');
   }

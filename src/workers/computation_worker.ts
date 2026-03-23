@@ -90,6 +90,60 @@ let workerConfig: {
 const priceHistory: Map<string, PriceTimeseries> = new Map();
 
 // ---------------------------------------------------------------------------
+// Wallet intel cache — avoid recomputing delay curves on every strategy tick.
+// Invalidated when a new wallet trade arrives for that wallet.
+// ---------------------------------------------------------------------------
+
+interface CachedWalletIntel {
+  score: import('../wallet_intel/types.js').WalletScore | null;
+  delayCurve: import('../wallet_intel/types.js').WalletDelayCurve | null;
+  regimeProfile: import('../wallet_intel/types.js').WalletRegimeProfile | null;
+  tradeCount: number; // invalidation key: recompute when trades.length changes
+}
+
+const walletIntelCache = new Map<string, CachedWalletIntel>();
+
+function getCachedWalletIntel(address: string): CachedWalletIntel | null {
+  const ws = state.getWallet(address);
+  if (!ws) return null;
+
+  const cached = walletIntelCache.get(address);
+  if (cached && cached.tradeCount === ws.trades.length) {
+    return cached;
+  }
+
+  // Recompute
+  const classification = classifyWallet(ws);
+  // Update wallet state with computed classification
+  ws.classification = classification.classification;
+  ws.confidence = classification.confidence;
+  const delayCurve = computeWalletDelayCurve(ws, priceHistory);
+  const regimeSpans = buildRegimeSpans([{
+    timestamp: state.regime.regime_since,
+    regime: state.regime.current_regime,
+  }]);
+  const regimeProfile = computeWalletRegimeProfile(ws, regimeSpans);
+  const score = scoreWallet({ wallet: ws, classification, delayCurve, regimeProfile });
+
+  log.debug({
+    wallet: address.slice(0, 10),
+    trades: ws.trades.length,
+    classification: classification.classification,
+    score: score.overall_score.toFixed(3),
+    recommendation: score.recommendation,
+  }, 'Wallet intel recomputed');
+
+  const entry: CachedWalletIntel = {
+    score,
+    delayCurve,
+    regimeProfile,
+    tradeCount: ws.trades.length,
+  };
+  walletIntelCache.set(address, entry);
+  return entry;
+}
+
+// ---------------------------------------------------------------------------
 // Send helper
 // ---------------------------------------------------------------------------
 
@@ -136,33 +190,16 @@ function init(cfg: typeof workerConfig): void {
     log.info({ from, to, confidence }, 'Regime change');
   };
 
-  // Build wallet intel provider
+  // Build wallet intel provider (uses cache to avoid recomputing delay curves)
   const walletIntelProvider: WalletIntelProvider = {
     getScore(address: string) {
-      const ws = state.getWallet(address);
-      if (!ws) return null;
-      const classification = classifyWallet(ws);
-      const delayCurve = computeWalletDelayCurve(ws, priceHistory);
-      const regimeSpans = buildRegimeSpans([{
-        timestamp: state.regime.regime_since,
-        regime: state.regime.current_regime,
-      }]);
-      const regimeProfile = computeWalletRegimeProfile(ws, regimeSpans);
-      return scoreWallet({ wallet: ws, classification, delayCurve, regimeProfile });
+      return getCachedWalletIntel(address)?.score ?? null;
     },
     getDelayCurve(address: string) {
-      const ws = state.getWallet(address);
-      if (!ws) return null;
-      return computeWalletDelayCurve(ws, priceHistory);
+      return getCachedWalletIntel(address)?.delayCurve ?? null;
     },
     getRegimeProfile(address: string) {
-      const ws = state.getWallet(address);
-      if (!ws) return null;
-      const regimeSpans = buildRegimeSpans([{
-        timestamp: state.regime.regime_since,
-        regime: state.regime.current_regime,
-      }]);
-      return computeWalletRegimeProfile(ws, regimeSpans);
+      return getCachedWalletIntel(address)?.regimeProfile ?? null;
     },
   };
 
@@ -368,6 +405,21 @@ function handleBookUpdate(snapshot: import('../ingestion/types.js').ParsedBookSn
   snapshot.market_id = market.market_id;
   state.updateMarket(snapshot);
 
+  // Populate price history for delay analysis curves
+  if (snapshot.mid_price > 0) {
+    const priceKey = `${market.market_id}:${snapshot.token_id}`;
+    let ts = priceHistory.get(priceKey);
+    if (!ts) {
+      ts = { market_id: market.market_id, token_id: snapshot.token_id, prices: [] };
+      priceHistory.set(priceKey, ts);
+    }
+    ts.prices.push({ timestamp: snapshot.timestamp, mid_price: snapshot.mid_price });
+    // Cap at 10000 entries per token (~4h at 1.5s polling) to bound memory
+    if (ts.prices.length > 10_000) {
+      ts.prices = ts.prices.slice(-10_000);
+    }
+  }
+
   // Feed to classifier and propagation model
   const side = market.tokens.yes_id === snapshot.token_id ? 'yes' : 'no';
   const updatedMarket = state.getMarket(market.market_id);
@@ -400,15 +452,160 @@ function handleTrade(trade: import('../ingestion/types.js').ParsedTrade): void {
   trade.market_id = market.market_id;
   state.updateMarketFromTrade(trade);
 
+  // Update price history from trades (more granular than book snapshots)
+  if (trade.price > 0) {
+    const priceKey = `${market.market_id}:${trade.token_id}`;
+    let ts = priceHistory.get(priceKey);
+    if (!ts) {
+      ts = { market_id: market.market_id, token_id: trade.token_id, prices: [] };
+      priceHistory.set(priceKey, ts);
+    }
+    ts.prices.push({ timestamp: trade.timestamp, mid_price: trade.price });
+    if (ts.prices.length > 10_000) {
+      ts.prices = ts.prices.slice(-10_000);
+    }
+  }
+
   const obs = marketClassifier.getObservations(market.market_id);
   const sizeUsd = trade.price * trade.size;
   recordTrade(obs, trade.timestamp, sizeUsd, trade.maker ?? '', trade.taker ?? '', null);
 }
 
+// Dedup wallet trades: main thread sends early (price=0) + enriched (price>0).
+// We record the trade on first arrival and only trigger strategy eval.
+// On the enriched re-send, we update the price but don't double-record.
+const walletTradesSeen = new Map<string, number>(); // dedupKey → expiry
+setInterval(() => {
+  const t = now();
+  for (const [k, exp] of walletTradesSeen) if (exp <= t) walletTradesSeen.delete(k);
+}, 30_000);
+
 function handleWalletTrade(tx: import('../ingestion/types.js').WalletTransaction): void {
   const resolved = state.resolveWalletTradeMarket(tx);
   if (!resolved) return;
-  state.recordWalletTradeWithRegime(resolved);
+
+  const dedupKey = `${resolved.wallet}:${resolved.token_id}:${resolved.side}:${resolved.size}:${resolved.tx_hash}`;
+  const alreadySeen = walletTradesSeen.has(dedupKey);
+
+  if (!alreadySeen) {
+    // First time seeing this trade — record it
+    walletTradesSeen.set(dedupKey, now() + 60_000);
+    state.recordWalletTradeWithRegime(resolved);
+  } else if (resolved.price > 0) {
+    // Re-send with enriched price — update the recorded trade's price
+    const ws = state.getWallet(resolved.wallet);
+    if (ws) {
+      const lastTrade = ws.trades[ws.trades.length - 1];
+      if (lastTrade && lastTrade.token_id === resolved.token_id && lastTrade.price <= 0) {
+        lastTrade.price = resolved.price;
+      }
+    }
+  }
+
+  // Trigger immediate strategy evaluation for this market when a tracked wallet trades.
+  // Don't wait for the 5s tick — copy-trading speed is critical.
+  // Use a synthetic edge map with just this market to skip expensive buildEdgeMap().
+  const walletIntel = getCachedWalletIntel(resolved.wallet);
+  const ws = state.getWallet(resolved.wallet);
+  log.debug({
+    wallet: resolved.wallet.slice(0, 10),
+    market: resolved.market_id?.slice(0, 16),
+    side: resolved.side,
+    price: resolved.price,
+  }, 'Wallet trade received in worker');
+
+  if (resolved.market_id && strategyEngine && initialClassificationDone) {
+    try {
+      const market = state.getMarket(resolved.market_id);
+      // If market has no book data yet, synthesize a minimal book from the trade price.
+      // This lets us evaluate immediately even for just-discovered markets.
+      if (market && market.book.yes.mid <= 0 && market.book.no.mid <= 0 && resolved.price > 0) {
+        const side = market.tokens.yes_id === resolved.token_id ? 'yes' : 'no';
+        market.book[side].mid = resolved.price;
+        market.book[side].bids = [[resolved.price - 0.005, 100]];
+        market.book[side].asks = [[resolved.price + 0.005, 100]];
+        market.book[side].spread = 0.01;
+        market.book[side].spread_bps = 100;
+        market.book[side].microprice = resolved.price;
+        market.book[side].last_updated = now();
+      }
+      if (market && (market.book.yes.mid > 0 || market.book.no.mid > 0)) {
+        // Build a minimal edge map containing just this market.
+        // The wallet_follow strategy only needs the market to exist in the edge map
+        // with wallet_follow listed as a viable strategy.
+        let classification = marketClassifier.classifications.get(resolved.market_id);
+        // If market hasn't been classified yet, create a minimal synthetic classification
+        // so the strategy engine doesn't skip it. Only wallet_follow needs to run.
+        if (!classification) {
+          classification = {
+            market_id: resolved.market_id,
+            market_type: 1,
+            type_confidence: 0.5,
+            confidence: 0.5,
+            efficiency_score: 0.5,
+            viable_strategies: ['wallet_follow'],
+            edge_estimate: 0,
+            edge_confidence: 0,
+            breakeven_latency_ms: null,
+            classified_at: now(),
+            features: {} as unknown as import('../analytics/types.js').MarketFeatures,
+          } as import('../analytics/types.js').MarketClassification;
+          marketClassifier.classifications.set(resolved.market_id, classification);
+        }
+        const syntheticEdgeMap: import('../analytics/types.js').EdgeMap = {
+          timestamp: now(),
+          measured_latency_p50_ms: workerConfig.default_latency_ms,
+          markets_with_edge: [{
+            market_id: resolved.market_id,
+            market_type: classification?.market_type ?? 1,
+            efficiency_score: classification?.efficiency_score ?? 0.5,
+            viable_strategies: ['wallet_follow'],
+            estimated_edge_per_trade: 0,
+            estimated_edge_confidence: 0,
+            capital_allocated: 1000,
+            breakeven_latency_ms: null,
+          }],
+          markets_without_edge: 0,
+          total_exploitable_capital: 1000,
+          idle_capital: 0,
+          recommendation: 'trade_selectively',
+        };
+        const result = strategyEngine.tick(state, syntheticEdgeMap, marketClassifier, resolved.market_id);
+        for (const signal of result.signals_generated) {
+          totalSignalsGenerated++;
+          send({ type: 'signal_generated', data: signal });
+        }
+        for (const filtered of result.signals_filtered) {
+          totalSignalsFiltered++;
+          send({
+            type: 'signal_filtered',
+            data: {
+              signal_id: filtered.signal_id,
+              strategy_id: filtered.strategy_id,
+              market_id: filtered.market_id,
+              reason: filtered.reason,
+              filter: filtered.filter,
+            },
+          });
+        }
+        if (result.signals_generated.length > 0) {
+          log.info(
+            { market_id: resolved.market_id, signals: result.signals_generated.length },
+            'Immediate strategy eval on wallet trade',
+          );
+        }
+      }
+    } catch (err) {
+      log.debug({ err }, 'Immediate strategy eval failed (non-fatal)');
+    }
+  }
+}
+
+function handleWalletListUpdate(added: string[], removed: string[]): void {
+  for (const addr of added) {
+    state.registerWallet(addr);
+  }
+  log.info({ added: added.length, removed: removed.length }, 'Worker: wallet list updated');
 }
 
 // ---------------------------------------------------------------------------
@@ -443,8 +640,29 @@ port.on('message', (msg: MainToWorkerMessage) => {
       handleWalletTrade(msg.data);
       break;
 
+    case 'wallet_trade_history':
+      // Bootstrap: record historical trades without triggering live strategy eval.
+      // These pre-populate wallet state so delay curves and scores are available.
+      for (const tx of msg.data) {
+        const resolved = state.resolveWalletTradeMarket(tx);
+        if (resolved) {
+          state.recordWalletTradeWithRegime(resolved);
+        }
+      }
+      // Invalidate intel cache so next access recomputes with full history
+      walletIntelCache.clear();
+      log.info(
+        { trades: msg.data.length },
+        'Bootstrap: recorded historical wallet trades',
+      );
+      break;
+
     case 'market_resolved':
       state.regimeDetector.recordResolution(now());
+      break;
+
+    case 'wallet_list_update':
+      handleWalletListUpdate(msg.data.added, msg.data.removed);
       break;
   }
 });

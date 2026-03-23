@@ -13,7 +13,8 @@
 // ---------------------------------------------------------------------------
 
 import { EventEmitter } from 'node:events';
-import { appendFileSync, mkdirSync, existsSync } from 'node:fs';
+import { appendFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import WebSocket from 'ws';
 import { now, dayKey } from '../utils/time.js';
@@ -161,6 +162,13 @@ export class WalletListener extends EventEmitter {
 
   getTrackedWallets(): string[] {
     return [...this.trackedWallets];
+  }
+
+  /** Force a reconnect to refresh topic filters after wallet list changes. */
+  forceReconnect(): void {
+    if (!this.running) return;
+    log.info('WalletListener forcing reconnect for updated wallet list');
+    this.handleDisconnect('config_reload');
   }
 
   // -----------------------------------------------------------------------
@@ -593,14 +601,15 @@ export class WalletListener extends EventEmitter {
   // -----------------------------------------------------------------------
 
   private persistRawEvent(rawEvent: RawEvent): void {
-    try {
-      const dir = this.rawEventsDir;
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const dir = this.rawEventsDir;
+    const doWrite = async () => {
+      if (!existsSync(dir)) await mkdir(dir, { recursive: true });
       const file = join(dir, `wallet_${dayKey(rawEvent.timestamp_ingested)}.jsonl`);
-      appendFileSync(file, JSON.stringify(rawEvent) + '\n');
-    } catch (err) {
+      await appendFile(file, JSON.stringify(rawEvent) + '\n');
+    };
+    doWrite().catch((err) => {
       log.warn({ err }, 'WalletListener: failed to persist raw event');
-    }
+    });
   }
 
   // -----------------------------------------------------------------------

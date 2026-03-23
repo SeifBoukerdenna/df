@@ -195,6 +195,11 @@ export class MarketMetadataFetcher extends EventEmitter {
       if (statusCode === 429) {
         const retryAfter = Number((headers as Record<string, string>)['retry-after'] ?? '5');
         await body.dump();
+        if (pageCount > maxPages + 5) {
+          // Safety: break after too many 429 retries to avoid infinite loop
+          log.warn({ offset, pageCount }, 'Too many 429 retries in fetchAllMarkets, stopping');
+          break;
+        }
         await sleep(retryAfter * 1000);
         continue;
       }

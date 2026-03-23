@@ -118,7 +118,7 @@
       "allowed_regimes": ["normal", "event_driven"],
       "min_statistical_confidence_t": 1.645,
       "max_parameter_sensitivity": 0.20,
-      "default_latency_ms": 20000,
+      "default_latency_ms": 3000,
       "signal_half_life_ms": 120000
     },
     "complement_arb": {
@@ -227,7 +227,22 @@
       "0xf5fe759cece500f58a431ef8dacea321f6e3e23d",
       "0xd0d6053c3c37e727402d84c14069780d360993aa",
       "0x154794795d978c5890b3f69264311f0bd966d066",
-      "0x7177a7f5c216809c577c50c77b12aae81f81ddef"
+      "0x7177a7f5c216809c577c50c77b12aae81f81ddef",
+      "0xff786965fa48e17dfaf320276fc42fac334ddf44",
+      "0x05e70727a2e2dcd079baa2ef1c0b88af06bb9641",
+      "0x969fae0a3a93778adc42178f72c612ed8c4e4d55",
+      "0x0006af12cd4dacc450836a0e1ec6ce47365d8c63",
+      "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",
+      "0xe40ea00e74059c76c0035c919ef6b99c3e25a94d",
+      "0x204f72f35326db932158cba6adff0b9a1da95e14",
+      "0x1398c3cd32fc6ac692cfe95b1f9ac94ab881a875",
+      "0xde17f7144fbd0eddb2679132c10ff5e74b120988",
+      "0x1521b47bf0c41f6b7fd3ad41cdec566812c8f23e",
+      "0x4ffba5035905ddfd5e80db2fcbf83a7b4c62119d",
+      "0x52fdda3e1f0aa2f4a667afb0d6ad5343b4644132",
+      "0xf6963d4cdbb6f26d753bda303e9513132afb1b7d",
+      "0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b",
+      "0x6a72f61820b26b1fe4d956e17b6dc2a1ea3033ee"
     ],
     "classification_min_trades": 30,
     "sniper_max_hold_seconds": 300,

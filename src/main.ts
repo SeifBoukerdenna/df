@@ -10,19 +10,22 @@
  */
 
 import { Worker } from 'node:worker_threads';
+import { appendFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { appendFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { program } from 'commander';
 import { config as cfg } from './utils/config.js';
 import type { Config } from './utils/config.js';
 import { getLogger } from './utils/logger.js';
-import { now } from './utils/time.js';
+import { now, dayKey } from './utils/time.js';
 import { WorldState } from './state/world_state.js';
 import { Ledger } from './ledger/ledger.js';
 import { ClobWebSocket } from './ingestion/clob_websocket.js';
 import { BookPoller } from './ingestion/book_poller.js';
 import { MarketMetadataFetcher } from './ingestion/market_metadata.js';
 import { WalletListener } from './ingestion/wallet_listener.js';
+import { WalletActivityPoller } from './ingestion/wallet_activity_poller.js';
 import {
   reportHealth,
   reportState,
@@ -47,7 +50,7 @@ import { ConsistencyChecker } from './analytics/consistency_checker.js';
 import { PropagationModel } from './analytics/propagation_model.js';
 import { paperExecute } from './execution/executor.js';
 import { Reconciliation } from './execution/reconciliation.js';
-import type { IngestionMetrics, ParsedTrade, ParsedBookSnapshot } from './ingestion/types.js';
+import type { IngestionMetrics, ParsedTrade, ParsedBookSnapshot, RawEvent, WalletTransaction } from './ingestion/types.js';
 import type { MainToWorkerMessage, WorkerToMainMessage } from './workers/messages.js';
 
 const log = getLogger('main');
@@ -287,7 +290,7 @@ async function runSystem(): Promise<void> {
 
   // Book update batching: collect snapshots and flush every 500ms to avoid
   // saturating the worker's message port with 1500+ individual messages/sec.
-  const FLUSH_INTERVAL_MS = 500;
+  const FLUSH_INTERVAL_MS = 100;
   let pendingBookUpdates: ParsedBookSnapshot[] = [];
 
   const flushTimer = setInterval(() => {
@@ -414,12 +417,26 @@ async function runSystem(): Promise<void> {
     reconnectMaxMs: config.ingestion.ws_reconnect_max_ms,
   });
 
+  // CLOB-side wallet detection: polls data-api.polymarket.com for each tracked
+  // wallet. This may detect trades BEFORE on-chain settlement, giving us a head
+  // start over the Alchemy WalletListener path. Both paths race — whichever
+  // fires first triggers strategy eval, and the dedup layer prevents duplicates.
+  const walletActivityPoller = new WalletActivityPoller({
+    trackedWallets: config.wallet_intel.tracked_wallets,
+    pollIntervalMs: 1_000, // 1s — aggressive polling for speed
+  });
+
   // Token ID → market_id index for O(1) lookups
   const tokenToMarketId = new Map<string, string>();
 
   // Recent CLOB trades buffer for enriching wallet transactions
   const recentClobTrades: ParsedTrade[] = [];
-  const MAX_RECENT_TRADES = 500;
+  const MAX_RECENT_TRADES = 2000;
+
+  // Track wallet positions for resolution event generation.
+  // When a market resolves, we emit synthetic SELL events at resolution price.
+  // Key: `${wallet}:${token_id}`, Value: position info
+  const walletPositions = new Map<string, { wallet: string; token_id: string; market_id: string; size: number }>();
 
   // ---------------------------------------------------------------------------
   // Event wiring: Ingestion → State (local) + Worker (forwarded)
@@ -457,6 +474,54 @@ async function runSystem(): Promise<void> {
     sendToWorker({ type: 'market_resolved', data: meta });
     ledger.append({ type: 'system_event', data: { event: 'market_resolved', details: meta } });
     log.info({ market_id: meta.market_id, resolution: meta.resolution }, 'Market resolved');
+
+    // Generate synthetic resolution events for tracked wallet positions
+    if (!meta.resolution) return;
+
+    const yesId = meta.tokens.yes_id;
+    const noId = meta.tokens.no_id;
+    const keysToDelete: string[] = [];
+
+    for (const [key, pos] of walletPositions) {
+      if (pos.market_id !== meta.market_id) continue;
+
+      const isYes = pos.token_id === yesId;
+      const isNo = pos.token_id === noId;
+      if (!isYes && !isNo) continue;
+
+      // Resolution price: winning token = $1.00, losing token = $0.00
+      const resolutionPrice =
+        (meta.resolution === 'YES' && isYes) || (meta.resolution === 'NO' && isNo)
+          ? 1.0
+          : 0.0;
+
+      const syntheticTx: WalletTransaction = {
+        wallet: pos.wallet,
+        market_id: meta.market_id,
+        token_id: pos.token_id,
+        side: 'SELL',
+        price: resolutionPrice,
+        size: pos.size,
+        timestamp: now(),
+        tx_hash: `resolution:${meta.market_id}:${pos.token_id}`,
+        block_number: 0,
+        gas_price: 0,
+      };
+
+      persistWalletEvent(syntheticTx, 'clob_ws');
+      state.recordWalletTradeWithRegime(syntheticTx);
+      sendToWorker({ type: 'wallet_trade', data: syntheticTx });
+
+      const walletShort = pos.wallet.slice(0, 6) + '\u2026' + pos.wallet.slice(-4);
+      log.info(
+        { wallet: pos.wallet, market_id: meta.market_id, resolution: meta.resolution, price: resolutionPrice, size: pos.size },
+        `wallet_resolution | [${walletShort}] closed @ $${resolutionPrice.toFixed(2)} — ${meta.question}`,
+      );
+
+      keysToDelete.push(key);
+    }
+
+    for (const key of keysToDelete) walletPositions.delete(key);
   });
 
   // Book snapshots from REST poller → local state + batch to worker
@@ -493,57 +558,227 @@ async function runSystem(): Promise<void> {
     if (recentClobTrades.length > MAX_RECENT_TRADES) {
       recentClobTrades.splice(0, recentClobTrades.length - MAX_RECENT_TRADES);
     }
+
+    // NOTE: CLOB WS does NOT expose maker/taker addresses (they are always empty
+    // strings in Polymarket's feed). Wallet detection runs exclusively through
+    // the on-chain Alchemy path (WalletListener → TransferSingle events).
+    // The CLOB trade feed is used only for book state, price enrichment, and
+    // market data — never for wallet identification.
   });
 
   // Token IDs that have already been queued for on-demand lookup (avoid duplicate calls)
   const pendingTokenLookups = new Set<string>();
+  // Cap concurrent Gamma lookups to avoid rate limiting
+  const MAX_CONCURRENT_LOOKUPS = 3;
+  const lookupQueue: string[] = []; // overflow queue for token IDs waiting to be looked up
 
-  // Wallet trades → local enrichment + forward to worker
-  walletListener.on('wallet_trade', (tx) => {
-    const resolved = state.resolveWalletTradeMarket(tx);
-    if (!resolved) {
-      // Token not in state — try on-demand Gamma API lookup
+  // Trades waiting on market discovery — queued so no trades are dropped
+  // Entries older than 60s are dropped to prevent unbounded growth if lookup hangs
+  const pendingDiscoveryTrades = new Map<string, { tx: WalletTransaction; source: 'clob_ws' | 'chain_listener'; queued_at: number }[]>();
+  setInterval(() => {
+    const cutoff = now() - 60_000;
+    for (const [tokenId, entries] of pendingDiscoveryTrades) {
+      const fresh = entries.filter((e) => e.queued_at > cutoff);
+      if (fresh.length === 0) {
+        pendingDiscoveryTrades.delete(tokenId);
+        pendingTokenLookups.delete(tokenId);
+        log.warn({ token_id: tokenId.slice(0, 20), dropped: entries.length }, 'wallet_trade | pending discovery timed out');
+      } else if (fresh.length < entries.length) {
+        pendingDiscoveryTrades.set(tokenId, fresh);
+      }
+    }
+  }, 15_000).unref();
+
+  // Tracked wallet set for CLOB-side detection
+  const trackedWalletsSet = new Set(
+    config.wallet_intel.tracked_wallets.map((w: string) => w.toLowerCase()),
+  );
+
+  // Cross-source dedup: prevent processing the same tx twice from CLOB + Alchemy
+  // CLOB fires ~4s before on-chain. Alchemy event arrives later and hits this dedup.
+  const walletTxSeen = new Map<string, number>(); // tx_hash → expiry ms
+  const WALLET_TX_TTL = 30_000;
+  setInterval(() => {
+    const t = now();
+    for (const [h, exp] of walletTxSeen) if (exp <= t) walletTxSeen.delete(h);
+  }, 30_000).unref();
+
+  function isWalletTxSeen(txHash: string): boolean {
+    if (!txHash) return false;
+    const exp = walletTxSeen.get(txHash);
+    return exp !== undefined && exp > now();
+  }
+  function markWalletTxSeen(txHash: string): void {
+    if (txHash) walletTxSeen.set(txHash, now() + WALLET_TX_TTL);
+  }
+
+  /** Persist a wallet trade event to the wallet JSONL for analysis (async, non-blocking). */
+  function persistWalletEvent(tx: WalletTransaction, source: 'clob_ws' | 'chain_listener'): void {
+    const rawEvent: RawEvent = {
+      source,
+      type: 'wallet_tx',
+      timestamp_ingested: now(),
+      timestamp_source: tx.timestamp,
+      raw_payload: {},
+      parsed: tx,
+      sequence_id: 0,
+    };
+    const dir = config.ingestion.raw_events_dir;
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const file = join(dir, `wallet_${dayKey(rawEvent.timestamp_ingested)}.jsonl`);
+    appendFile(file, JSON.stringify(rawEvent) + '\n').catch((err) => {
+      log.warn({ err }, 'Failed to persist wallet event');
+    });
+  }
+
+  /** Drains the token lookup queue, respecting MAX_CONCURRENT_LOOKUPS to avoid Gamma API throttling. */
+  let activeLookups = 0;
+  async function drainLookupQueue(): Promise<void> {
+    while (lookupQueue.length > 0 && activeLookups < MAX_CONCURRENT_LOOKUPS) {
+      const tokenId = lookupQueue.shift()!;
+      activeLookups++;
+      log.info({ tokenId: tokenId.slice(0, 20), queue: lookupQueue.length }, 'wallet_trade | new market — discovering...');
+
+      try {
+        const meta = await metadataFetcher.lookupByTokenId(tokenId);
+        pendingTokenLookups.delete(tokenId);
+        const waiting = pendingDiscoveryTrades.get(tokenId) ?? [];
+        pendingDiscoveryTrades.delete(tokenId);
+
+        if (!meta) {
+          if (waiting.length > 0) log.warn({ token_id: tokenId.slice(0, 20), dropped: waiting.length }, 'wallet_trade | market lookup failed, trades dropped');
+        } else {
+          log.info({ token_id: tokenId.slice(0, 20), market: meta.question, trades: waiting.length }, 'wallet_trade | market discovered, replaying');
+          try {
+            const snap = await bookPoller.fetchBookOnDemand(tokenId, meta.market_id);
+            if (snap) { state.updateMarket(snap); clobWs.updateBookSnapshot(snap); }
+          } catch { /* non-fatal */ }
+          for (const entry of waiting) {
+            const retryResolved = state.resolveWalletTradeMarket(entry.tx);
+            if (retryResolved) await processWalletTrade(retryResolved, entry.source);
+            else await processWalletTrade({ ...entry.tx, market_id: meta.market_id }, entry.source);
+          }
+        }
+      } catch {
+        pendingTokenLookups.delete(tokenId);
+        const dropped = pendingDiscoveryTrades.get(tokenId)?.length ?? 0;
+        pendingDiscoveryTrades.delete(tokenId);
+        if (dropped > 0) log.warn({ token_id: tokenId.slice(0, 20), dropped }, 'wallet_trade | lookup error, trades dropped');
+      } finally {
+        activeLookups--;
+      }
+    }
+    // If there are still items queued, they'll be drained on next call
+    if (lookupQueue.length > 0) void drainLookupQueue();
+  }
+
+  /** Core wallet trade processor — called from data-api poller, Alchemy, or internal paths. */
+  async function processWalletTrade(tx: WalletTransaction, source: 'clob_ws' | 'chain_listener'): Promise<void> {
+    // For 'clob_ws' (data-api path): tx has price but may lack market_id.
+    // Try to resolve market_id from our token index first.
+    let resolved: WalletTransaction | null;
+    if (source === 'clob_ws') {
+      if (!tx.market_id && tx.token_id) {
+        const knownMarketId = tokenToMarketId.get(tx.token_id);
+        resolved = knownMarketId ? { ...tx, market_id: knownMarketId } : state.resolveWalletTradeMarket(tx);
+      } else {
+        resolved = tx;
+      }
+    } else {
+      resolved = state.resolveWalletTradeMarket(tx);
+    }
+
+    if (!resolved || !resolved.market_id) {
+      // Unknown market — queue trade and trigger on-demand discovery
+      const queued = pendingDiscoveryTrades.get(tx.token_id) ?? [];
+      queued.push({ tx, source, queued_at: now() });
+      pendingDiscoveryTrades.set(tx.token_id, queued);
+
       if (!pendingTokenLookups.has(tx.token_id)) {
         pendingTokenLookups.add(tx.token_id);
-        log.info(
-          { wallet: tx.wallet, side: tx.side },
-          'wallet_trade | new market — discovering...',
-        );
-        metadataFetcher.lookupByTokenId(tx.token_id).then((meta) => {
-          if (!meta) {
-            log.warn({ token_id: tx.token_id.slice(0, 20) }, 'wallet_trade | market lookup failed, trade dropped');
-          }
-          // market_created event will fire automatically via metadataFetcher.emit(),
-          // which will register it in state for future trades
-        }).catch(() => { /* logged inside lookupByTokenId */ });
+        lookupQueue.push(tx.token_id);
+        void drainLookupQueue();
       }
       return;
     }
 
-    const enriched = state.enrichWalletTradePrice(resolved, recentClobTrades);
+    let enriched = source === 'clob_ws'
+      ? resolved
+      : state.enrichWalletTradePrice(resolved, recentClobTrades);
+
+    // FAST PATH: Send to worker immediately with whatever price we have.
+    // The worker can start strategy evaluation while we do async price enrichment.
+    // The worker uses its own book state for the delay curve anyway.
+    if (enriched.market_id) {
+      sendToWorker({ type: 'wallet_trade', data: enriched });
+    }
+
+    // Fallback 1: fetch recent trade price from CLOB REST API (exact fill price)
+    if (enriched.price <= 0 && enriched.token_id) {
+      try {
+        const tradePrice = await bookPoller.fetchRecentTradePrice(enriched.token_id);
+        if (tradePrice !== null) enriched = { ...enriched, price: tradePrice };
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    // Fallback 2: use existing book best_ask/best_bid from state (realistic fill price)
+    if (enriched.price <= 0 && enriched.market_id) {
+      const mkt = state.getMarket(enriched.market_id);
+      if (mkt) {
+        const bookSide = mkt.tokens.yes_id === enriched.token_id ? 'yes' : 'no';
+        const book = mkt.book[bookSide];
+        // Use best_ask for BUYs (what buyer pays), best_bid for SELLs (what seller gets)
+        // bids sorted desc, asks sorted asc — [0] is best
+        const fillPrice = enriched.side === 'BUY'
+          ? (book.asks[0]?.[0] ?? book.mid)
+          : (book.bids[0]?.[0] ?? book.mid);
+        if (fillPrice > 0 && fillPrice < 1) enriched = { ...enriched, price: fillPrice };
+      }
+    }
+
+    // Fallback 3: on-demand REST book fetch (one fast API call)
+    if (enriched.price <= 0 && enriched.market_id) {
+      try {
+        const snap = await bookPoller.fetchBookOnDemand(enriched.token_id, enriched.market_id);
+        if (snap && snap.mid_price > 0) {
+          // Use best_ask for BUYs, best_bid for SELLs (realistic fill price)
+          const fillPrice = enriched.side === 'BUY'
+            ? (snap.asks[0]?.[0] ?? snap.mid_price)
+            : (snap.bids[0]?.[0] ?? snap.mid_price);
+          enriched = { ...enriched, price: fillPrice };
+          // Also update state book for future lookups
+          state.updateMarket(snap);
+          clobWs.updateBookSnapshot(snap);
+        }
+      } catch {
+        // Non-fatal — proceed with price unknown
+      }
+    }
+
     state.recordWalletTradeWithRegime(enriched);
-    sendToWorker({ type: 'wallet_trade', data: enriched });
+    // Worker already received early notification above (fast path).
+    // Send enriched version only if price was updated by fallbacks.
+    if (enriched.price > 0 && enriched.market_id) {
+      sendToWorker({ type: 'wallet_trade', data: enriched });
+    }
+    persistWalletEvent(enriched, source);
 
     const mkt = state.getMarket(enriched.market_id);
     const marketQuestion = mkt?.question ?? enriched.market_id;
-
-    // If CLOB trade didn't match, fall back to book mid for the correct side
     let displayPrice = enriched.price;
     if (displayPrice <= 0 && mkt) {
-      const side = mkt.tokens.yes_id === enriched.token_id ? 'yes' : 'no';
-      displayPrice = mkt.book[side].mid;
+      const bookSide = mkt.tokens.yes_id === enriched.token_id ? 'yes' : 'no';
+      displayPrice = mkt.book[bookSide].mid;
     }
-    const priceStr = displayPrice > 0 ? `@ $${displayPrice.toFixed(3)} (est)` : '@ price unknown';
+    const priceStr = displayPrice > 0
+      ? `@ $${displayPrice.toFixed(3)}${source === 'clob_ws' ? '' : ' (est)'}`
+      : '@ price unknown';
     const walletShort = enriched.wallet.slice(0, 6) + '…' + enriched.wallet.slice(-4);
     log.info(
-      {
-        wallet: enriched.wallet,
-        side: enriched.side,
-        size: enriched.size.toFixed(1),
-        price: displayPrice > 0 ? displayPrice : undefined,
-        market: marketQuestion,
-      },
-      `wallet_trade | [${walletShort}] ${enriched.side} ${enriched.size.toFixed(1)} shares ${priceStr} — ${marketQuestion}`,
+      { wallet: enriched.wallet, side: enriched.side, size: enriched.size.toFixed(1), price: displayPrice > 0 ? displayPrice : undefined, market: marketQuestion, source },
+      `wallet_trade | [${walletShort}] ${enriched.side} ${enriched.size.toFixed(1)} shares ${priceStr} — ${marketQuestion} [${source}]`,
     );
 
     ledger.append({
@@ -559,9 +794,52 @@ async function runSystem(): Promise<void> {
           price: enriched.price,
           block: enriched.block_number,
           ingested_at: enriched.timestamp,
+          source,
         },
       },
     });
+
+    // Track wallet positions for resolution event generation
+    if (!enriched.tx_hash.startsWith('resolution:')) {
+      const posKey = `${enriched.wallet}:${enriched.token_id}`;
+      if (enriched.side === 'BUY') {
+        const existing = walletPositions.get(posKey);
+        walletPositions.set(posKey, {
+          wallet: enriched.wallet,
+          token_id: enriched.token_id,
+          market_id: enriched.market_id,
+          size: (existing?.size ?? 0) + enriched.size,
+        });
+      } else {
+        const existing = walletPositions.get(posKey);
+        if (existing) {
+          const remaining = existing.size - enriched.size;
+          if (remaining <= 0) walletPositions.delete(posKey);
+          else walletPositions.set(posKey, { ...existing, size: remaining });
+        }
+      }
+    }
+  }
+
+  // Wallet trades → local enrichment + forward to worker
+  walletListener.on('wallet_trade', (tx) => {
+    // Skip if CLOB already processed this tx (CLOB fires ~4s earlier)
+    if (tx.tx_hash && isWalletTxSeen(tx.tx_hash)) return;
+    // Mark seen so if Alchemy fires twice we don't double-process
+    markWalletTxSeen(tx.tx_hash);
+
+    void processWalletTrade(tx, 'chain_listener');
+  });
+
+  // CLOB-side wallet trades from data-api polling (may arrive BEFORE on-chain)
+  walletActivityPoller.on('wallet_trade', (tx) => {
+    // Dedup: if Alchemy already processed this tx, skip
+    if (tx.tx_hash && isWalletTxSeen(tx.tx_hash)) return;
+    markWalletTxSeen(tx.tx_hash);
+
+    // This path already has price from the data-api — use 'clob_ws' source
+    // so processWalletTrade skips the enrichment waterfall
+    void processWalletTrade(tx, 'clob_ws');
   });
 
   // Error handlers
@@ -569,6 +847,7 @@ async function runSystem(): Promise<void> {
   bookPoller.on('error', (err, context) => log.warn({ err, context }, 'BookPoller error'));
   metadataFetcher.on('error', (err) => log.warn({ err }, 'MetadataFetcher error'));
   walletListener.on('error', (err) => log.warn({ err }, 'WalletListener error'));
+  walletActivityPoller.on('error', (err) => log.warn({ err }, 'WalletActivityPoller error'));
 
   // ---------------------------------------------------------------------------
   // State snapshots (main thread, every 5 min)
@@ -608,6 +887,7 @@ async function runSystem(): Promise<void> {
     bookPoller.stop();
     metadataFetcher.stop();
     walletListener.stop();
+    walletActivityPoller.stop();
 
     clearInterval(flushTimer);
     clearInterval(snapshotInterval);
@@ -641,6 +921,78 @@ async function runSystem(): Promise<void> {
   clobWs.start();
   walletListener.start();
 
+  // Bootstrap historical wallet trades AFTER metadata has loaded.
+  // Wait 8s for the initial metadata batch to populate tokenToMarketId,
+  // then fetch historical trades so we can resolve token_id → market_id.
+  setTimeout(() => {
+    walletActivityPoller.bootstrap(100).then((historicalTrades) => {
+      if (historicalTrades.length > 0) {
+        const resolved = historicalTrades.map(tx => {
+          if (!tx.market_id && tx.token_id) {
+            const knownMarketId = tokenToMarketId.get(tx.token_id);
+            if (knownMarketId) return { ...tx, market_id: knownMarketId };
+            const r = state.resolveWalletTradeMarket(tx);
+            return r ?? tx;
+          }
+          return tx;
+        }).filter(tx => tx.market_id);
+
+        log.info(
+          { total: historicalTrades.length, resolved: resolved.length, known_tokens: tokenToMarketId.size },
+          'Sending historical wallet trades to worker for delay curve bootstrap',
+        );
+        sendToWorker({ type: 'wallet_trade_history', data: resolved });
+      }
+      // Start live polling AFTER bootstrap completes
+      walletActivityPoller.start();
+    }).catch((err) => {
+      log.warn({ err }, 'Wallet bootstrap failed, starting live polling anyway');
+      walletActivityPoller.start();
+    });
+  }, 8_000);
+
+  // ---------------------------------------------------------------------------
+  // Wallet hot-reload: watch config/default.json for tracked_wallets changes
+  // ---------------------------------------------------------------------------
+
+  const configPath = join(__dirname, '..', 'config', 'default.json');
+  let lastTrackedWallets = JSON.stringify([...trackedWalletsSet].sort());
+  const configWatchInterval = setInterval(() => {
+    try {
+      const fresh = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+      const walletIntel = fresh['wallet_intel'] as Record<string, unknown> | undefined;
+      const newWallets: string[] = ((walletIntel?.['tracked_wallets'] as string[]) ?? []).map(w => w.toLowerCase());
+      const freshStr = JSON.stringify(newWallets.sort());
+      if (freshStr === lastTrackedWallets) return;
+
+      const added = newWallets.filter(w => !trackedWalletsSet.has(w));
+      const removed = [...trackedWalletsSet].filter(w => !newWallets.includes(w));
+
+      for (const w of added) {
+        trackedWalletsSet.add(w);
+        walletListener.addWallet(w);
+        walletActivityPoller.addWallet(w);
+      }
+      for (const w of removed) {
+        trackedWalletsSet.delete(w);
+        walletListener.removeWallet(w);
+        walletActivityPoller.removeWallet(w);
+      }
+
+      lastTrackedWallets = freshStr;
+      if (added.length > 0 || removed.length > 0) {
+        walletListener.forceReconnect(); // Re-subscribe with updated wallet list
+        // Forward wallet list changes to worker thread
+        sendToWorker({ type: 'wallet_list_update', data: { added, removed } });
+        log.info(
+          { added: added.length, removed: removed.length, total: trackedWalletsSet.size },
+          'Wallet list hot-reloaded from config/default.json',
+        );
+      }
+    } catch { /* ignore parse errors from partial writes */ }
+  }, 5_000);
+  configWatchInterval.unref();
+
   // ---------------------------------------------------------------------------
   // Periodic diagnostics (every 30s for first 5 minutes)
   // ---------------------------------------------------------------------------
@@ -662,6 +1014,10 @@ async function runSystem(): Promise<void> {
       markets_with_trades: marketsWithTrades,
       clob_ws_events: clobWs.metrics.events_received,
       clob_ws_eps: Math.round(clobWs.metrics.events_per_second * 100) / 100,
+      // Data-api poller stats
+      data_api_polls: walletActivityPoller.metrics.polls,
+      data_api_trades: walletActivityPoller.metrics.trades_detected,
+      data_api_avg_ms: Math.round(walletActivityPoller.metrics.avg_poll_ms),
       // Worker stats
       worker_strategy_ticks: workerStrategyTicks,
       worker_signals_total: workerSignalsTotal,

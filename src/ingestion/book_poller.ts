@@ -73,6 +73,59 @@ export class BookPoller extends EventEmitter {
     this.lastPollAt.delete(tokenId);
   }
 
+  /**
+   * Fetch recent trades for a token from CLOB REST API.
+   * Used to enrich wallet trades detected on-chain with actual fill prices.
+   * Returns the most recent trade price or null.
+   */
+  async fetchRecentTradePrice(tokenId: string): Promise<number | null> {
+    const urlObj = new URL(this.clobRestUrl);
+    const path = `${urlObj.pathname}/trades?asset_id=${encodeURIComponent(tokenId)}&limit=5`.replace('//', '/');
+
+    try {
+      const { statusCode, body: responseBody } = await this.pool.request({
+        method: 'GET',
+        path,
+        headers: { accept: 'application/json' },
+        headersTimeout: 5_000,
+        bodyTimeout: 5_000,
+      });
+
+      if (statusCode < 200 || statusCode >= 300) {
+        await responseBody.dump();
+        return null;
+      }
+
+      const data = (await responseBody.json()) as unknown;
+      const trades = Array.isArray(data) ? data : (data as { data?: unknown[] })?.data ?? [];
+      if (trades.length === 0) return null;
+
+      const first = trades[0] as Record<string, unknown>;
+      const price = Number(first['price'] ?? 0);
+      return price > 0 && price < 1 ? price : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * On-demand book fetch for a single token. Used to get price data when
+   * Alchemy detects a wallet trade and we need the current bid/ask immediately.
+   * Returns the snapshot or null if fetch fails.
+   */
+  async fetchBookOnDemand(tokenId: string, marketId: string): Promise<ParsedBookSnapshot | null> {
+    const books = await this.fetchBooks([tokenId]);
+    if (!books || books.length === 0) return null;
+    const r = books[0] as Record<string, unknown>;
+    const assetId = (r['asset_id'] as string | undefined) ?? tokenId;
+    const snapshot = parseBookResponse(r, assetId, marketId);
+    if (snapshot) {
+      this.lastPollAt.set(assetId, now());
+      this.emit('book_snapshot', snapshot);
+    }
+    return snapshot;
+  }
+
   start(): void {
     if (this.pollTimer !== null) return;
     log.info({ tokens: this.trackedTokens.size }, 'BookPoller starting');

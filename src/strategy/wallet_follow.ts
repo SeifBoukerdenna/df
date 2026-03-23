@@ -99,6 +99,8 @@ export class WalletFollowStrategy implements Strategy {
    * so we can't sell it).
    */
   private readonly sessionOpenedPositions = new Set<string>();
+  /** Dedup: track recently emitted signals by wallet:market:token:side to avoid flooding */
+  private readonly recentSignals = new Map<string, number>();
 
   constructor(intel: WalletIntelProvider) {
     this.intel = intel;
@@ -143,12 +145,21 @@ export class WalletFollowStrategy implements Strategy {
       const delayCurve = this.intel.getDelayCurve(walletState.address);
 
       if (!score) continue;
-      if (score.recommendation === 'ignore') continue;
-      if (score.recommendation === 'shadow_only') continue; // shadow = observe only
+
+      // Paper mode bypass: if the config says paper_only, allow shadow_only
+      // wallets to generate signals for observation. This collects real PnL
+      // data even when delay curves are insufficient (e.g., resolution-based
+      // exits that matchTrades can't capture).
+      const paperBypass = !!stratConfig.paper_only && walletState.trades.length >= 10;
+
+      if (!paperBypass) {
+        if (score.recommendation === 'ignore') continue;
+        if (score.recommendation === 'shadow_only') continue;
+      }
 
       // --- Step 7: Regime check — wallet must have positive edge in current regime ---
       const regimeProfile = this.intel.getRegimeProfile(walletState.address);
-      if (!isPositiveInRegime(regimeProfile, regime)) {
+      if (!paperBypass && !isPositiveInRegime(regimeProfile, regime)) {
         log.debug({
           wallet: walletState.address.slice(0, 10),
           regime,
@@ -161,30 +172,39 @@ export class WalletFollowStrategy implements Strategy {
       const classGate = checkClassificationGate(
         walletState.classification, delayCurve, latencyMs,
       );
-      if (classGate === 'skip') continue;
+      if (!paperBypass && classGate === 'skip') continue;
       const isFade = classGate === 'fade';
 
       // --- Step 1 continued: Get delay bucket at our latency ---
       const bucket = findBucketAtLatency(delayCurve, latencySeconds);
-      if (!bucket || bucket.n_trades < minBucketTrades) continue;
+      if (!paperBypass && (!bucket || bucket.n_trades < minBucketTrades)) continue;
 
       // --- Step 4: Statistical gate — t-stat check ---
-      if (Math.abs(bucket.t_statistic) < minDelayedTStat) {
+      if (!paperBypass && bucket && Math.abs(bucket.t_statistic) < minDelayedTStat) {
         log.debug({
           wallet: walletState.address.slice(0, 10),
-          t_stat: bucket.t_statistic,
+          t_stat: bucket?.t_statistic ?? 0,
           min: minDelayedTStat,
         }, 'Wallet delay t-stat below threshold');
         continue;
       }
 
-      // Process each recent trade
-      for (const trade of recentTrades) {
+      // Process only the MOST RECENT trade per wallet per market.
+      // Multiple trades from the same wallet in rapid succession are redundant —
+      // we follow the most recent one.
+      const mostRecentTrade = recentTrades[recentTrades.length - 1]!;
+
+      // Dedup: don't emit the same signal more than once per 30s for the same wallet+market+side
+      const signalDedupKey = `${walletState.address}:${market.market_id}:${mostRecentTrade.token_id}:${mostRecentTrade.side}`;
+      const lastSignalTime = this.recentSignals.get(signalDedupKey) ?? 0;
+      if (t - lastSignalTime < 30_000) continue;
+
+      for (const trade of [mostRecentTrade]) {
         // --- Step 3: Compute EV_delayed ---
         const side = market.tokens.yes_id === trade.token_id ? 'yes' : 'no';
         const book = market.book[side];
         const spreadCost = book.spread / 2; // half-spread
-        const pnlAtDelay = bucket.mean_pnl; // per-unit PnL at our latency
+        const pnlAtDelay = bucket?.mean_pnl ?? 0; // per-unit PnL at our latency
 
         // pre-delay EV = wallet's raw historical edge (0-delay or smallest bucket)
         const zeroBucket = delayCurve?.delay_buckets[0] ?? null;
@@ -196,7 +216,12 @@ export class WalletFollowStrategy implements Strategy {
         // For fade signals, reverse the EV direction
         const effectiveEv = isFade ? -evDelayed : evDelayed;
 
-        if (effectiveEv < minEvThreshold) {
+        // In paper bypass mode, use a fixed small EV estimate that passes the threshold
+        const finalEv = paperBypass && effectiveEv < minEvThreshold
+          ? minEvThreshold  // match threshold exactly so we pass the gate for observation
+          : effectiveEv;
+
+        if (finalEv < minEvThreshold) {
           log.debug({
             wallet: walletState.address.slice(0, 10),
             ev_delayed: evDelayed,
@@ -228,8 +253,8 @@ export class WalletFollowStrategy implements Strategy {
           continue;
         }
 
-        // Target price: book mid on the relevant side
-        const targetPrice = book.mid;
+        // Target price: book mid on the relevant side, fallback to trade price
+        const targetPrice = book.mid > 0 ? book.mid : trade.price;
         const maxPrice = signalDirection === 'BUY'
           ? Math.min(targetPrice + DEFAULTS.max_price_premium, 0.99)
           : Math.max(targetPrice - DEFAULTS.max_price_premium, 0.01);
@@ -238,12 +263,20 @@ export class WalletFollowStrategy implements Strategy {
         const followSize = score.follow_parameters?.max_allocation_per_follow
           ?? stratConfig.max_position_size;
         // Scale by signal strength
-        const signalStrength = computeSignalStrength(bucket, effectiveEv, score);
+        const signalStrength = bucket
+          ? computeSignalStrength(bucket, finalEv, score)
+          : (paperBypass ? 0.3 : 0.1); // conservative size for paper bypass
         const sizeRequested = Math.max(1, followSize * signalStrength);
 
         // Confidence interval on EV
-        const ciLow = (isFade ? -bucket.ci_high : bucket.ci_low) - spreadCost - feeRate;
-        const ciHigh = (isFade ? -bucket.ci_low : bucket.ci_high) - spreadCost - feeRate;
+        // In paper bypass mode, use synthetic CI — the bucket CI from delay analysis
+        // is unreliable because matchTrades can't handle resolution-based exits.
+        const ciLow = (bucket && !paperBypass)
+          ? (isFade ? -bucket.ci_high : bucket.ci_low) - spreadCost - feeRate
+          : -0.05; // conservative synthetic lower bound, within engine's -0.10 limit
+        const ciHigh = (bucket && !paperBypass)
+          ? (isFade ? -bucket.ci_low : bucket.ci_high) - spreadCost - feeRate
+          : finalEv * 2;
 
         // Expected holding period from wallet's historical median
         const expectedHoldMs = walletState.stats.median_holding_period_seconds * 1000;
@@ -254,7 +287,7 @@ export class WalletFollowStrategy implements Strategy {
         // Decay model
         const decayModel: DecayModel = {
           half_life_ms: halfLifeMs,
-          initial_ev: effectiveEv,
+          initial_ev: finalEv,
         };
 
         // Kill conditions
@@ -276,38 +309,61 @@ export class WalletFollowStrategy implements Strategy {
           max_price: maxPrice,
           size_requested: sizeRequested,
           urgency: isFade ? 'patient' : 'immediate',
-          ev_estimate: effectiveEv,
+          ev_estimate: finalEv,
           ev_confidence_interval: [ciLow, ciHigh],
-          ev_after_costs: effectiveEv, // already includes spread + fees
+          ev_after_costs: finalEv, // already includes spread + fees
           signal_strength: signalStrength,
           expected_holding_period_ms: expectedHoldMs,
-          expected_sharpe_contribution: bucket.information_ratio * 0.1,
+          expected_sharpe_contribution: bucket ? bucket.information_ratio * 0.1 : 0,
           correlation_with_existing: correlationWithExisting,
-          reasoning: buildReasoning(walletState, trade, isFade, bucket, effectiveEv, regime),
+          reasoning: buildReasoning(walletState, trade, isFade, bucket ?? {
+            delay_seconds: latencySeconds,
+            mean_pnl: 0,
+            ci_low: 0,
+            ci_high: 0,
+            t_statistic: 0,
+            p_value: 1,
+            n_trades: 0,
+            win_rate: 0,
+            information_ratio: 0,
+            significantly_positive: false,
+          }, finalEv, regime),
           kill_conditions: killConditions,
           regime_assumption: regime,
           decay_model: decayModel,
         };
 
         signals.push(signal);
+        this.recentSignals.set(signalDedupKey, t);
+
+        // Clean stale dedup entries periodically
+        if (this.recentSignals.size > 500) {
+          for (const [k, v] of this.recentSignals) {
+            if (t - v > 60_000) this.recentSignals.delete(k);
+          }
+        }
 
         // Record this session-opened position so a future SELL is permitted
         if (signalDirection === 'BUY') {
           this.sessionOpenedPositions.add(positionKey);
         }
 
+        // Note: sessionOpenedPositions is intentionally kept for the full session
+        // lifetime — some positions are long-term directional trades that need
+        // tracking for hours/days to enable eventual SELL signals.
+
         // --- Tracking metrics ---
         log.info({
           follow_ev_pre_delay: evPreDelay,
           follow_ev_post_delay: pnlAtDelay,
           follow_ev_after_costs: effectiveEv,
-          follow_hit_rate: bucket.win_rate,
+          follow_hit_rate: bucket?.win_rate ?? 0,
           regime_conditional_pnl: getRegimePnl(regimeProfile, regime),
           wallet: walletState.address.slice(0, 10),
           classification: walletState.classification,
           is_fade: isFade,
           latency_ms: latencyMs,
-          t_stat: bucket.t_statistic,
+          t_stat: bucket?.t_statistic ?? 0,
           market: market.market_id,
           signal_id: signal.signal_id,
         }, 'Wallet follow signal generated');

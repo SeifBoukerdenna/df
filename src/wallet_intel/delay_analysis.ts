@@ -94,6 +94,9 @@ function matchTrades(trades: WalletTransaction[]): MatchedTrade[] {
   const openPositions = new Map<string, { price: number; size: number; timestamp: number }[]>();
 
   for (const trade of trades) {
+    // Skip trades with no valid price — they would corrupt delay PnL calculations
+    if (trade.price <= 0) continue;
+
     const key = `${trade.market_id}:${trade.token_id}`;
 
     if (trade.side === 'BUY') {

@@ -161,11 +161,15 @@ export class StrategyEngine {
    * eligible markets. Returns generated and filtered signals.
    *
    * Call this on every state update cycle (e.g., every 1–5 seconds).
+   *
+   * @param focusMarketId - If provided, only evaluate this market (used for
+   *   immediate copy-trading evaluation when a tracked wallet trades).
    */
   tick(
     world: WorldState,
     edgeMap: EdgeMap,
     classifier: MarketClassifier,
+    focusMarketId?: string,
   ): EngineTickResult {
     const tickStart = nowHr();
     const t = now();
@@ -212,8 +216,11 @@ export class StrategyEngine {
       // Count active positions for this strategy (for max_concurrent check)
       const activePositionCount = this.countActivePositions(world, strategyId);
 
-      // Iterate all markets with edge
+      // Iterate all markets with edge (or just the focused market)
       for (const edgeEntry of edgeMap.markets_with_edge) {
+        // If we have a focus market, skip all others (fast path for copy-trading)
+        if (focusMarketId && edgeEntry.market_id !== focusMarketId) continue;
+
         const market = world.markets.get(edgeEntry.market_id);
         if (!market || market.status !== 'active') continue;
 
@@ -260,6 +267,15 @@ export class StrategyEngine {
           const filterReason = this.filterSignal(signal, reg, edgeEntry, world, t);
 
           if (filterReason !== null) {
+            log.debug(
+              {
+                strategy: signal.strategy_id,
+                market: signal.market_id?.slice(0, 12),
+                filter: filterReason.filter,
+                reason: filterReason.reason,
+              },
+              'Engine filter rejected signal',
+            );
             const filtered: FilteredSignal = {
               signal_id: signal.signal_id,
               strategy_id: signal.strategy_id,

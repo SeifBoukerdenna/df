@@ -58,6 +58,21 @@ export interface MarketResolvedMessage {
   data: MarketMetadata;
 }
 
+/** Batch of historical wallet trades for bootstrapping delay curves */
+export interface WalletTradeHistoryMessage {
+  type: 'wallet_trade_history';
+  data: WalletTransaction[];
+}
+
+/** Notify worker of tracked wallet list changes (hot-reload) */
+export interface WalletListUpdateMessage {
+  type: 'wallet_list_update';
+  data: {
+    added: string[];
+    removed: string[];
+  };
+}
+
 export type MainToWorkerMessage =
   | InitMessage
   | MarketRegisteredMessage
@@ -65,7 +80,9 @@ export type MainToWorkerMessage =
   | BookUpdateBatchMessage
   | TradeMessage
   | WalletTradeMessage
-  | MarketResolvedMessage;
+  | WalletTradeHistoryMessage
+  | MarketResolvedMessage
+  | WalletListUpdateMessage;
 
 // ---------------------------------------------------------------------------
 // Worker → Main messages
