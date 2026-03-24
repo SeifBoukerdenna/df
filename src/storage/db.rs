@@ -16,6 +16,7 @@ pub enum StorageError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("no snapshot found")]
+    #[allow(dead_code)]
     NoSnapshot,
     #[error("schema version mismatch: expected {expected}, got {got}")]
     SchemaMismatch { expected: i32, got: i32 },
@@ -44,6 +45,7 @@ impl Store {
     }
 
     /// Open an in-memory database (for testing).
+    #[allow(dead_code)]
     pub fn open_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
         let mut store = Self { conn };
@@ -152,6 +154,7 @@ impl Store {
         Ok(events)
     }
 
+    #[allow(dead_code)]
     pub fn event_count(&self, session_id: &str) -> Result<i64, StorageError> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM events WHERE session_id = ?1",
@@ -177,6 +180,7 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    #[allow(dead_code)]
     pub fn load_latest_snapshot(
         &self,
         session_id: &str,
@@ -289,6 +293,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_active_markets(
         &self,
     ) -> Result<Vec<MarketRow>, StorageError> {
@@ -338,7 +343,7 @@ impl Store {
     }
 
     /// Look up market question and outcome label for a token_id.
-    /// Returns (question, outcome) e.g. ("Will X happen?", "Yes") or None.
+    #[allow(dead_code)]
     pub fn lookup_token_market(&self, token_id: &str) -> Option<(String, String)> {
         // Try as Yes token
         let result = self.conn.query_row(
@@ -392,11 +397,13 @@ impl Store {
         map
     }
 
+    #[allow(dead_code)]
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MarketRow {
     pub condition_id: String,
@@ -412,7 +419,6 @@ pub struct MarketRow {
 mod tests {
     use super::*;
     use crate::core::event::NormalizedEvent;
-    use crate::core::types::DataQuality;
     use chrono::Utc;
 
     #[test]

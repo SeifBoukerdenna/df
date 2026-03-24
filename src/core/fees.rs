@@ -129,6 +129,72 @@ async fn fetch_fee_rate(
     Ok(rate)
 }
 
+/// Resolve fee from cache only — no network calls. For hot-path use.
+/// Fees should be pre-cached during startup/discovery.
+pub fn resolve_from_cache(store: &Store, token_id: &TokenId, cache_ttl_secs: u64) -> ResolvedFee {
+    let ttl_ms = (cache_ttl_secs as i64) * 1000;
+
+    // Try cached within TTL
+    if let Ok(Some((rate_str, _source))) = store.get_cached_fee(token_id, ttl_ms) {
+        if let Ok(rate) = rate_str.parse::<Decimal>() {
+            return ResolvedFee {
+                rate_bps: Some(rate),
+                source: FeeSource::Cached,
+            };
+        }
+    }
+
+    // Try cached any age
+    if let Ok(Some(rate_str)) = store.get_cached_fee_any_age(token_id) {
+        if let Ok(rate) = rate_str.parse::<Decimal>() {
+            return ResolvedFee {
+                rate_bps: Some(rate),
+                source: FeeSource::Cached,
+            };
+        }
+    }
+
+    ResolvedFee {
+        rate_bps: None,
+        source: FeeSource::Unavailable,
+    }
+}
+
+/// Pre-cache fees for a batch of tokens. Fire-and-forget with concurrency limit.
+pub async fn precache_fees(
+    client: &reqwest::Client,
+    store: &Store,
+    token_ids: &[TokenId],
+) {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
+    let mut handles = Vec::with_capacity(token_ids.len());
+
+    for tid in token_ids {
+        let client = client.clone();
+        let token_id = tid.clone();
+        let sem = semaphore.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            fetch_fee_rate(&client, &token_id).await
+                .map(|rate| (token_id, rate))
+        }));
+    }
+
+    let mut cached = 0usize;
+    for handle in handles {
+        if let Ok(Ok((token_id, rate))) = handle.await {
+            if let Err(e) = store.set_cached_fee(&token_id, &rate.to_string(), "live") {
+                tracing::warn!(token_id, error = %e, "failed to pre-cache fee");
+            } else {
+                cached += 1;
+            }
+        }
+    }
+
+    tracing::info!(cached, total = token_ids.len(), "fee pre-caching complete");
+}
+
 /// Calculate the fee amount for a trade using Polymarket's formula.
 ///
 /// fee = shares * price * feeRate/10000 * (price * (1 - price))

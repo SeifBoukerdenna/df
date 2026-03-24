@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::core::types::{BookLevel, TokenId};
 
@@ -17,23 +17,21 @@ pub struct RestBookSnapshot {
 }
 
 /// Raw CLOB book response.
+///
+/// The /book endpoint returns flat JSON with bids/asks arrays alongside
+/// metadata fields (market, asset_id, hash, neg_risk, tick_size, etc.).
+/// Error responses return `{"error": "..."}` with HTTP 200.
 #[derive(Debug, Deserialize)]
 struct ClobBookResponse {
     #[serde(default)]
     bids: Option<Vec<ClobBookLevel>>,
     #[serde(default)]
     asks: Option<Vec<ClobBookLevel>>,
-    // Also handle the nested "market" wrapper some endpoints use
+    /// Present on error responses (e.g. "No orderbook exists for the requested token id")
     #[serde(default)]
-    market: Option<ClobBookMarket>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ClobBookMarket {
-    #[serde(default)]
-    bids: Option<Vec<ClobBookLevel>>,
-    #[serde(default)]
-    asks: Option<Vec<ClobBookLevel>>,
+    error: Option<String>,
+    // Ignore all other fields: market (string), asset_id, hash, neg_risk,
+    // tick_size, min_order_size, last_trade_price, timestamp
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,17 +60,18 @@ pub async fn fetch_book(
         return Err(format!("CLOB book HTTP {}", resp.status()).into());
     }
 
-    let body: ClobBookResponse = resp.json().await?;
+    let text = resp.text().await?;
+    let body: ClobBookResponse = serde_json::from_str(&text).map_err(|e| {
+        format!("CLOB JSON parse error: {e} (body starts with: {})", &text[..text.len().min(120)])
+    })?;
 
-    // Handle both direct bids/asks and nested market.bids/asks
-    let raw_bids = body
-        .bids
-        .or_else(|| body.market.as_ref().and_then(|m| m.bids.clone()))
-        .unwrap_or_default();
-    let raw_asks = body
-        .asks
-        .or_else(|| body.market.as_ref().and_then(|m| m.asks.clone()))
-        .unwrap_or_default();
+    // Error responses come back as HTTP 200 with {"error": "..."}
+    if let Some(err_msg) = body.error {
+        return Err(format!("CLOB book error: {err_msg}").into());
+    }
+
+    let raw_bids = body.bids.unwrap_or_default();
+    let raw_asks = body.asks.unwrap_or_default();
 
     let bids = parse_levels(&raw_bids);
     let asks = parse_levels(&raw_asks);
@@ -190,5 +189,36 @@ mod tests {
         ];
         let levels = parse_levels(&raw);
         assert!(levels.is_empty());
+    }
+
+    #[test]
+    fn deserialize_real_clob_response() {
+        // Real response format from CLOB /book endpoint
+        let json = r#"{
+            "market":"0x2d429de90b306726d64125dd93a632710cc8d376",
+            "asset_id":"88880538160054803170694248740611409585042586136919230840822633337213652798324",
+            "timestamp":"1774330500699",
+            "hash":"894c3440f67fa98aaf3fc04f6253ae41ba2cc7e2",
+            "bids":[{"price":"0.43","size":"7964"},{"price":"0.42","size":"548"}],
+            "asks":[{"price":"0.55","size":"713"},{"price":"0.56","size":"32"}],
+            "min_order_size":"5",
+            "tick_size":"0.01",
+            "neg_risk":false,
+            "last_trade_price":"0.490"
+        }"#;
+        let resp: ClobBookResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.error.is_none());
+        assert_eq!(resp.bids.as_ref().unwrap().len(), 2);
+        assert_eq!(resp.asks.as_ref().unwrap().len(), 2);
+        assert_eq!(resp.bids.as_ref().unwrap()[0].price, "0.43");
+    }
+
+    #[test]
+    fn deserialize_error_response() {
+        let json = r#"{"error":"No orderbook exists for the requested token id"}"#;
+        let resp: ClobBookResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.error.is_some());
+        assert!(resp.bids.is_none());
+        assert!(resp.asks.is_none());
     }
 }

@@ -2,27 +2,29 @@
 
 [session]
 # Starting paper capital in USDC.
-starting_capital = "10000"
+starting_capital = "1000000"
 # Maximum fraction of capital for a single copy trade (0.0 to 1.0).
 max_position_fraction = "0.10"
-# Maximum slippage in bps before a fill is skipped.
-max_slippage_bps = "200"
+# Maximum slippage in bps before a fill is skipped (global default).
+# Category overrides below can widen this for directional.
+max_slippage_bps = "300"
 # How to value open positions: "conservative" (best bid), "midpoint", or "last_trade".
 marking_mode = "conservative"
 
 [wallets]
-directional_file = "config/tracked_wallets/directional_wallets.txt"
-arbitrage_file = "config/tracked_wallets/arbitrage_wallets.txt"
+# Supports both .toml (rich metadata) and .txt (plain addresses) formats.
+# If the configured file doesn't exist, the engine tries the other extension.
+directional_file = "config/tracked_wallets/directional_wallets.toml"
+arbitrage_file = "config/tracked_wallets/arbitrage_wallets.toml"
 
 [latency]
 # Wallet trade polling mode: "baseline" or "aggressive".
-# Baseline: directional 3s, arbitrage 5s. Aggressive: directional 1.5s, arbitrage 3s.
 polling_mode = "aggressive"
 # Simulated arrival delay in ms (time for our order to reach the exchange after detection).
 arrival_delay_ms = 500
 # Override polling intervals per category (ms). Uncomment to customize.
-directional_interval_ms = 2500
-# arbitrage_interval_ms = 5000
+# directional_interval_ms = 2000
+# arbitrage_interval_ms = 1500
 
 [fees]
 # TTL for cached fee rates in seconds.
@@ -38,6 +40,10 @@ metadata_refresh_secs = 300
 stale_threshold_secs = 30
 # Seconds of market inactivity before unsubscribing from book data.
 market_prune_secs = 1800
+# Optional: Polygon WebSocket RPC for on-chain OrderFilled event detection.
+# Enables ~2-4s detection latency (vs ~30s REST polling).
+# Get a free key from Alchemy or QuickNode.
+polygon_rpc_ws = "wss://polygon-mainnet.g.alchemy.com/v2/EcRCiNAXJXzC22dzlU1gc"
 
 [storage]
 db_path = "data/df.db"
@@ -47,3 +53,21 @@ sessions_dir = "sessions"
 [reporting]
 # Mark-to-market interval in seconds for live unrealized PnL updates.
 mark_interval_secs = 5
+
+# === Category-specific overrides ===
+# Any setting here overrides the session default for that category.
+# Omitted fields inherit from [session].
+
+# Directional wallets — conviction bets, slower signal decay.
+# Wider tolerances are appropriate since the edge persists longer.
+[category.directional]
+max_slippage_bps = "500"
+# No detection age limit — directional signals stay relevant longer.
+
+# Arbitrage wallets — fast-decaying edge, structurally disadvantaged by REST polling.
+# Tighter tolerances because stale arb signals are worthless.
+[category.arbitrage]
+max_slippage_bps = "200"
+max_position_fraction = "0.05"
+# Skip arb trades detected more than 15s after execution — they're already stale.
+max_detection_age_ms = 15000

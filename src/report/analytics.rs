@@ -27,9 +27,18 @@ pub struct SessionAnalytics {
     pub realized_fees: Decimal,
     pub realized_pnl_net: Decimal,
     pub turnover: Decimal,
+    /// Unrealized PnL from open positions (mark-to-market).
+    pub unrealized_pnl: Option<Decimal>,
+    /// Unrealized PnL after estimated exit fees.
+    pub unrealized_pnl_after_fees: Option<Decimal>,
+    /// Net PnL = realized_net + unrealized_after_fees.
+    pub net_pnl: Option<Decimal>,
 
-    // Per-wallet breakdown
+    // Per-wallet breakdown (now with PnL)
     pub wallet_stats: Vec<WalletStats>,
+
+    // Per-category aggregates
+    pub category_stats: Vec<CategoryAggregateStats>,
 
     // Per-token breakdown
     pub token_stats: Vec<TokenStats>,
@@ -41,6 +50,8 @@ pub struct SessionAnalytics {
     pub avg_detection_delay_ms: Option<f64>,
     pub avg_processing_delay_ms: Option<f64>,
     pub median_detection_delay_ms: Option<u64>,
+    /// Per-category latency
+    pub category_detection_delays: HashMap<String, Vec<u64>>,
 
     // Fee breakdown
     pub fee_source_counts: HashMap<String, usize>,
@@ -57,16 +68,39 @@ pub struct SessionAnalytics {
     pub last_event_ts: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WalletStats {
     pub wallet: WalletAddr,
+    pub display_name: String,
+    pub profile_url: Option<String>,
     pub category: WalletCategory,
     pub trade_count: usize,
     pub fill_count: usize,
     pub miss_count: usize,
+    pub fill_rate_pct: Decimal,
+    pub realized_pnl: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub volume: Decimal,
+    pub fees_paid: Decimal,
+    pub open_exposure: Decimal,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryAggregateStats {
+    pub category: WalletCategory,
+    pub trade_count: usize,
+    pub fill_count: usize,
+    pub miss_count: usize,
+    pub fill_rate_pct: Decimal,
+    pub realized_pnl_gross: Decimal,
+    pub realized_fees: Decimal,
+    pub realized_pnl_net: Decimal,
+    pub volume: Decimal,
+    pub avg_detection_delay_ms: Option<f64>,
+    pub median_detection_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TokenStats {
     pub token_id: TokenId,
     pub market_question: Option<String>,
@@ -81,6 +115,7 @@ pub struct TokenStats {
 pub struct TradeRecord {
     pub ts: DateTime<Utc>,
     pub wallet: WalletAddr,
+    pub wallet_display_name: String,
     pub category: WalletCategory,
     pub token_id: TokenId,
     pub market_question: Option<String>,
@@ -97,11 +132,23 @@ pub struct TradeRecord {
     pub detection_delay_ms: Option<u64>,
 }
 
+/// Live portfolio state for injecting unrealized PnL into analytics.
+/// Pass `None` if computing from a cold session (no live book state).
+pub struct LivePortfolioState<'a> {
+    pub portfolio: &'a crate::sim::portfolio::Portfolio,
+    pub books: &'a HashMap<TokenId, crate::core::book::OrderBook>,
+    pub marking_mode: MarkingMode,
+    pub store: &'a Store,
+}
+
 /// Compute full session analytics from the event log.
 pub fn compute_analytics(
     store: &Store,
     session_id: &str,
     starting_capital: Decimal,
+    wallet_names: &HashMap<String, String>,
+    wallet_profiles: &HashMap<String, Option<String>>,
+    live_state: Option<&LivePortfolioState<'_>>,
 ) -> Result<SessionAnalytics, Box<dyn std::error::Error>> {
     let events = store.load_events_after(session_id, 0)?;
     let token_names = store.build_token_name_map();
@@ -124,32 +171,22 @@ pub fn compute_analytics(
     let mut detection_delays: Vec<u64> = Vec::new();
     let mut processing_delays: Vec<u64> = Vec::new();
     let mut book_quality_counts: HashMap<String, usize> = HashMap::new();
+    let mut category_detection_delays: HashMap<String, Vec<u64>> = HashMap::new();
 
     let mut trades: Vec<TradeRecord> = Vec::new();
-
-    // Map tx_hash → wallet trade info for joining with fills
     let mut pending_trades: HashMap<String, PendingTrade> = HashMap::new();
 
     let mut first_ts: Option<DateTime<Utc>> = None;
     let mut last_ts: Option<DateTime<Utc>> = None;
 
-    // Track position cost basis for realized PnL per token
     let mut position_avg_entry: HashMap<TokenId, Decimal> = HashMap::new();
     let mut position_qty: HashMap<TokenId, Decimal> = HashMap::new();
 
     for (_id, event) in &events {
         match event {
             NormalizedEvent::WalletTrade {
-                wallet,
-                category,
-                token_id,
-                side,
-                price,
-                size,
-                tx_hash,
-                detected_at,
-                source_ts,
-                ..
+                wallet, category, token_id, side, price, size, tx_hash,
+                detected_at, source_ts, ..
             } => {
                 total_wallet_trades += 1;
 
@@ -165,6 +202,9 @@ pub fn compute_analytics(
                         trade_count: 0,
                         fill_count: 0,
                         miss_count: 0,
+                        realized_pnl: Decimal::ZERO,
+                        volume: Decimal::ZERO,
+                        fees_paid: Decimal::ZERO,
                     });
                 ws.trade_count += 1;
 
@@ -184,26 +224,13 @@ pub fn compute_analytics(
             }
 
             NormalizedEvent::SimulatedFill {
-                wallet_trade_ref,
-                fill_result,
-                avg_price,
-                filled_qty,
-                fee_amount,
-                fee_source,
-                slippage_bps,
-                latency,
-                book_quality,
-                ..
+                wallet_trade_ref, fill_result, avg_price, filled_qty,
+                fee_amount, fee_source, slippage_bps, latency, book_quality, ..
             } => {
                 let pt = pending_trades.remove(wallet_trade_ref);
 
-                *book_quality_counts
-                    .entry(format!("{book_quality}"))
-                    .or_default() += 1;
-
-                *fee_source_counts
-                    .entry(format!("{fee_source}"))
-                    .or_default() += 1;
+                *book_quality_counts.entry(format!("{book_quality}")).or_default() += 1;
+                *fee_source_counts.entry(format!("{fee_source}")).or_default() += 1;
 
                 if *fee_source == FeeSource::Unavailable && *filled_qty > Decimal::ZERO {
                     degraded_fill_count += 1;
@@ -211,6 +238,12 @@ pub fn compute_analytics(
 
                 if let Some(d) = latency.detection_delay_ms {
                     detection_delays.push(d);
+                    if let Some(ref pt) = pt {
+                        category_detection_delays
+                            .entry(format!("{}", pt.category))
+                            .or_default()
+                            .push(d);
+                    }
                 }
                 if let Some(d) = latency.processing_delay_ms {
                     processing_delays.push(d);
@@ -226,8 +259,7 @@ pub fn compute_analytics(
                     FillResult::Full => {
                         total_fills += 1;
                         if let Some(ref pt) = pt {
-                            let ws = wallet_map.get_mut(&pt.wallet);
-                            if let Some(ws) = ws {
+                            if let Some(ws) = wallet_map.get_mut(&pt.wallet) {
                                 ws.fill_count += 1;
                             }
                         }
@@ -235,8 +267,7 @@ pub fn compute_analytics(
                     FillResult::Partial { .. } => {
                         total_partials += 1;
                         if let Some(ref pt) = pt {
-                            let ws = wallet_map.get_mut(&pt.wallet);
-                            if let Some(ws) = ws {
+                            if let Some(ws) = wallet_map.get_mut(&pt.wallet) {
                                 ws.fill_count += 1;
                             }
                         }
@@ -245,15 +276,13 @@ pub fn compute_analytics(
                         total_misses += 1;
                         *miss_reasons.entry(format!("{reason:?}")).or_default() += 1;
                         if let Some(ref pt) = pt {
-                            let ws = wallet_map.get_mut(&pt.wallet);
-                            if let Some(ws) = ws {
+                            if let Some(ws) = wallet_map.get_mut(&pt.wallet) {
                                 ws.miss_count += 1;
                             }
                         }
                     }
                 }
 
-                // Track per-token stats and PnL
                 if let Some(ref pt) = pt {
                     let ts = token_map
                         .entry(pt.token_id.clone())
@@ -268,11 +297,16 @@ pub fn compute_analytics(
                     realized_fees += fee_amount;
                     turnover += cost;
 
+                    // Per-wallet volume and fees
+                    if let Some(ws) = wallet_map.get_mut(&pt.wallet) {
+                        ws.volume += cost;
+                        ws.fees_paid += *fee_amount;
+                    }
+
                     match pt.side {
                         Side::Buy => {
                             ts.buy_count += 1;
                             ts.total_volume += cost;
-                            // Update position tracking
                             let qty = position_qty.entry(pt.token_id.clone()).or_default();
                             let avg = position_avg_entry.entry(pt.token_id.clone()).or_default();
                             let old_cost = *avg * *qty;
@@ -288,11 +322,15 @@ pub fn compute_analytics(
                                 .get(&pt.token_id)
                                 .copied()
                                 .unwrap_or(Decimal::ZERO);
-                            let pnl = (avg_price.unwrap_or(Decimal::ZERO) - entry_price)
-                                * filled_qty;
+                            let pnl = (avg_price.unwrap_or(Decimal::ZERO) - entry_price) * filled_qty;
                             ts.realized_pnl += pnl;
                             realized_pnl_gross += pnl;
-                            // Reduce position
+
+                            // Per-wallet realized PnL
+                            if let Some(ws) = wallet_map.get_mut(&pt.wallet) {
+                                ws.realized_pnl += pnl;
+                            }
+
                             if let Some(qty) = position_qty.get_mut(&pt.token_id) {
                                 *qty -= filled_qty;
                             }
@@ -303,9 +341,16 @@ pub fn compute_analytics(
                         .get(&pt.token_id)
                         .map(|(q, o)| (Some(q.clone()), Some(o.clone())))
                         .unwrap_or((None, None));
+
+                    let wallet_display = wallet_names
+                        .get(&pt.wallet)
+                        .cloned()
+                        .unwrap_or_else(|| abbreviate_address(&pt.wallet));
+
                     trades.push(TradeRecord {
                         ts: pt.source_ts,
                         wallet: pt.wallet.clone(),
+                        wallet_display_name: wallet_display,
                         category: pt.category,
                         token_id: pt.token_id.clone(),
                         market_question: mq,
@@ -357,14 +402,101 @@ pub fn compute_analytics(
         Some(sorted[sorted.len() / 2])
     };
 
+    // Get per-wallet unrealized + exposure from live portfolio state
+    let (unrealized_by_wallet, exposure_by_wallet) = match live_state {
+        Some(ls) => (
+            ls.portfolio.unrealized_by_wallet(ls.books, ls.marking_mode),
+            ls.portfolio.exposure_by_wallet(ls.books, ls.marking_mode),
+        ),
+        None => (HashMap::new(), HashMap::new()),
+    };
+
+    // Build per-wallet stats with names
     let wallet_stats: Vec<WalletStats> = wallet_map
         .into_iter()
-        .map(|(wallet, b)| WalletStats {
-            wallet,
-            category: b.category,
-            trade_count: b.trade_count,
-            fill_count: b.fill_count,
-            miss_count: b.miss_count,
+        .map(|(wallet, b)| {
+            let display_name = wallet_names
+                .get(&wallet)
+                .cloned()
+                .unwrap_or_else(|| abbreviate_address(&wallet));
+            let profile_url = wallet_profiles.get(&wallet).cloned().flatten();
+            let total_attempts = b.fill_count + b.miss_count;
+            let fill_rate = if total_attempts > 0 {
+                Decimal::new(b.fill_count as i64, 0)
+                    / Decimal::new(total_attempts as i64, 0)
+                    * Decimal::new(100, 0)
+            } else {
+                Decimal::ZERO
+            };
+            let unrealized = unrealized_by_wallet.get(&wallet).copied().unwrap_or(Decimal::ZERO);
+            let exposure = exposure_by_wallet.get(&wallet).copied().unwrap_or(Decimal::ZERO);
+            WalletStats {
+                wallet,
+                display_name,
+                profile_url,
+                category: b.category,
+                trade_count: b.trade_count,
+                fill_count: b.fill_count,
+                miss_count: b.miss_count,
+                fill_rate_pct: fill_rate.round_dp(1),
+                realized_pnl: b.realized_pnl,
+                unrealized_pnl: unrealized,
+                volume: b.volume,
+                fees_paid: b.fees_paid,
+                open_exposure: exposure,
+            }
+        })
+        .collect();
+
+    // Build per-category aggregates
+    let mut cat_agg: HashMap<WalletCategory, CatAggBuilder> = HashMap::new();
+    for ws in &wallet_stats {
+        let agg = cat_agg.entry(ws.category).or_default();
+        agg.trade_count += ws.trade_count;
+        agg.fill_count += ws.fill_count;
+        agg.miss_count += ws.miss_count;
+        agg.realized_pnl_gross += ws.realized_pnl;
+        agg.fees += ws.fees_paid;
+        agg.volume += ws.volume;
+    }
+
+    let category_stats: Vec<CategoryAggregateStats> = cat_agg
+        .into_iter()
+        .map(|(cat, agg)| {
+            let total = agg.fill_count + agg.miss_count;
+            let fill_rate = if total > 0 {
+                Decimal::new(agg.fill_count as i64, 0)
+                    / Decimal::new(total as i64, 0)
+                    * Decimal::new(100, 0)
+            } else {
+                Decimal::ZERO
+            };
+
+            let cat_delays = category_detection_delays.get(&format!("{cat}"));
+            let avg_det = cat_delays
+                .filter(|d| !d.is_empty())
+                .map(|d| d.iter().sum::<u64>() as f64 / d.len() as f64);
+            let median_det = cat_delays
+                .filter(|d| !d.is_empty())
+                .map(|d| {
+                    let mut s = d.clone();
+                    s.sort();
+                    s[s.len() / 2]
+                });
+
+            CategoryAggregateStats {
+                category: cat,
+                trade_count: agg.trade_count,
+                fill_count: agg.fill_count,
+                miss_count: agg.miss_count,
+                fill_rate_pct: fill_rate.round_dp(1),
+                realized_pnl_gross: agg.realized_pnl_gross,
+                realized_fees: agg.fees,
+                realized_pnl_net: agg.realized_pnl_gross - agg.fees,
+                volume: agg.volume,
+                avg_detection_delay_ms: avg_det,
+                median_detection_delay_ms: median_det,
+            }
         })
         .collect();
 
@@ -387,6 +519,17 @@ pub fn compute_analytics(
         })
         .collect();
 
+    // Compute unrealized PnL from live state if available
+    let realized_net = realized_pnl_gross - realized_fees;
+    let (unrealized, unrealized_after_fees, net_pnl) = match live_state {
+        Some(ls) => {
+            let raw = ls.portfolio.unrealized_pnl(ls.books, ls.marking_mode);
+            let after_fees = ls.portfolio.unrealized_pnl_after_fees(ls.books, ls.marking_mode, Some(ls.store));
+            (Some(raw), Some(after_fees), Some(realized_net + after_fees))
+        }
+        None => (None, None, None),
+    };
+
     Ok(SessionAnalytics {
         session_id: session_id.to_string(),
         starting_capital,
@@ -398,14 +541,19 @@ pub fn compute_analytics(
         fill_rate_pct: fill_rate_pct.round_dp(1),
         realized_pnl_gross,
         realized_fees,
-        realized_pnl_net: realized_pnl_gross - realized_fees,
+        realized_pnl_net: realized_net,
         turnover,
+        unrealized_pnl: unrealized,
+        unrealized_pnl_after_fees: unrealized_after_fees,
+        net_pnl,
         wallet_stats,
+        category_stats,
         token_stats,
         miss_reasons,
         avg_detection_delay_ms: avg_detection,
         avg_processing_delay_ms: avg_processing,
         median_detection_delay_ms: median_detection,
+        category_detection_delays,
         fee_source_counts,
         degraded_fill_count,
         book_quality_counts,
@@ -415,11 +563,32 @@ pub fn compute_analytics(
     })
 }
 
+fn abbreviate_address(addr: &str) -> String {
+    if addr.len() > 10 {
+        format!("{}…{}", &addr[..6], &addr[addr.len() - 4..])
+    } else {
+        addr.to_string()
+    }
+}
+
 struct WalletStatsBuilder {
     category: WalletCategory,
     trade_count: usize,
     fill_count: usize,
     miss_count: usize,
+    realized_pnl: Decimal,
+    volume: Decimal,
+    fees_paid: Decimal,
+}
+
+#[derive(Default)]
+struct CatAggBuilder {
+    trade_count: usize,
+    fill_count: usize,
+    miss_count: usize,
+    realized_pnl_gross: Decimal,
+    fees: Decimal,
+    volume: Decimal,
 }
 
 struct TokenStatsBuilder {
@@ -453,15 +622,20 @@ mod tests {
     #[test]
     fn analytics_empty_session() {
         let store = Store::open_memory().unwrap();
-        let a = compute_analytics(&store, "s1", dec!(10000)).unwrap();
+        let names = HashMap::new();
+        let profiles = HashMap::new();
+        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None).unwrap();
         assert_eq!(a.total_events, 0);
         assert_eq!(a.total_wallet_trades, 0);
         assert_eq!(a.fill_rate_pct, dec!(0));
+        assert!(a.unrealized_pnl.is_none()); // no live state
     }
 
     #[test]
     fn analytics_one_trade() {
         let store = Store::open_memory().unwrap();
+        let names = HashMap::new();
+        let profiles = HashMap::new();
         let now = Utc::now();
 
         let wt = NormalizedEvent::WalletTrade {
@@ -498,7 +672,7 @@ mod tests {
         };
         store.append_event("s1", &fill).unwrap();
 
-        let a = compute_analytics(&store, "s1", dec!(10000)).unwrap();
+        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None).unwrap();
         assert_eq!(a.total_wallet_trades, 1);
         assert_eq!(a.total_fills, 1);
         assert_eq!(a.total_misses, 0);
@@ -506,5 +680,154 @@ mod tests {
         assert_eq!(a.trades.len(), 1);
         assert_eq!(a.wallet_stats.len(), 1);
         assert_eq!(a.avg_detection_delay_ms, Some(3000.0));
+        // Category stats should be populated
+        assert!(!a.category_stats.is_empty());
+    }
+
+    #[test]
+    fn detection_too_old_classified_correctly() {
+        let store = Store::open_memory().unwrap();
+        let names = HashMap::new();
+        let profiles = HashMap::new();
+        let now = Utc::now();
+
+        let wt = NormalizedEvent::WalletTrade {
+            wallet: "0xabc".into(),
+            category: WalletCategory::Arbitrage,
+            token_id: "t1".into(),
+            market_id: "m1".into(),
+            side: Side::Buy,
+            price: dec!(0.50),
+            size: dec!(100),
+            tx_hash: "tx1".into(),
+            detected_at: now,
+            source_ts: now,
+        };
+        store.append_event("s1", &wt).unwrap();
+
+        let miss = NormalizedEvent::SimulatedFill {
+            wallet_trade_ref: "tx1".into(),
+            our_side: Side::Buy,
+            fill_result: FillResult::Miss {
+                reason: MissReason::DetectionTooOld,
+            },
+            avg_price: None,
+            filled_qty: Decimal::ZERO,
+            fee_rate: None,
+            fee_amount: Decimal::ZERO,
+            fee_source: FeeSource::Unavailable,
+            slippage_bps: None,
+            latency: LatencyComponents {
+                detection_delay_ms: Some(20000),
+                processing_delay_ms: Some(0),
+                arrival_delay_ms: 500,
+            },
+            book_quality: DataQuality::Stale,
+            exit_actionability: None,
+        };
+        store.append_event("s1", &miss).unwrap();
+
+        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None).unwrap();
+        assert_eq!(a.total_misses, 1);
+        assert_eq!(a.miss_reasons.get("DetectionTooOld"), Some(&1));
+        // Must NOT be classified as StaleBook
+        assert_eq!(a.miss_reasons.get("StaleBook"), None);
+    }
+
+    #[test]
+    fn per_wallet_unrealized_present_with_live_state() {
+        use crate::core::book::OrderBook;
+        use crate::core::types::BookLevel;
+        use crate::sim::portfolio::Portfolio;
+
+        let store = Store::open_memory().unwrap();
+        let names = HashMap::new();
+        let profiles = HashMap::new();
+        let now = Utc::now();
+
+        // Record a wallet trade + fill
+        let wt = NormalizedEvent::WalletTrade {
+            wallet: "0xabc".into(),
+            category: WalletCategory::Directional,
+            token_id: "t1".into(),
+            market_id: "m1".into(),
+            side: Side::Buy,
+            price: dec!(0.50),
+            size: dec!(100),
+            tx_hash: "tx1".into(),
+            detected_at: now,
+            source_ts: now,
+        };
+        store.append_event("s1", &wt).unwrap();
+
+        let fill = NormalizedEvent::SimulatedFill {
+            wallet_trade_ref: "tx1".into(),
+            our_side: Side::Buy,
+            fill_result: FillResult::Full,
+            avg_price: Some(dec!(0.50)),
+            filled_qty: dec!(100),
+            fee_rate: Some(dec!(25)),
+            fee_amount: dec!(0.03),
+            fee_source: FeeSource::Live,
+            slippage_bps: Some(dec!(0)),
+            latency: LatencyComponents {
+                detection_delay_ms: Some(3000),
+                processing_delay_ms: Some(1),
+                arrival_delay_ms: 500,
+            },
+            book_quality: DataQuality::Good,
+            exit_actionability: None,
+        };
+        store.append_event("s1", &fill).unwrap();
+
+        // Build live state with a book that shows the position is up
+        let mut portfolio = Portfolio::new(dec!(10000));
+        let fill_output = crate::sim::fill::FillOutput {
+            result: FillResult::Full,
+            avg_price: Some(dec!(0.50)),
+            filled_qty: dec!(100),
+            cost: dec!(50),
+            fee_amount: dec!(0.03),
+            fee_rate_bps: Some(dec!(25)),
+            fee_source: FeeSource::Live,
+            slippage_bps: Some(dec!(0)),
+            book_quality: DataQuality::Good,
+            exit_actionability: None,
+            latency: LatencyComponents {
+                detection_delay_ms: Some(3000),
+                processing_delay_ms: Some(1),
+                arrival_delay_ms: 500,
+            },
+        };
+        portfolio.apply_buy(&"t1".into(), "m1", &fill_output, &"0xabc".into(), WalletCategory::Directional).unwrap();
+        portfolio.record_full();
+
+        let mut books = HashMap::new();
+        let mut book = OrderBook::new("t1".into());
+        book.apply_snapshot(
+            &[BookLevel { price: dec!(0.55), size: dec!(10000) }],
+            &[BookLevel { price: dec!(0.60), size: dec!(10000) }],
+        );
+        books.insert("t1".to_string(), book);
+
+        let live = LivePortfolioState {
+            portfolio: &portfolio,
+            books: &books,
+            marking_mode: MarkingMode::Conservative,
+            store: &store,
+        };
+
+        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, Some(&live)).unwrap();
+
+        // Unrealized should be present
+        assert!(a.unrealized_pnl.is_some());
+        let unrealized = a.unrealized_pnl.unwrap();
+        // 100 shares * 0.55 (best bid) - 50 cost = 5
+        assert_eq!(unrealized, dec!(5));
+
+        // Per-wallet unrealized should exist
+        assert_eq!(a.wallet_stats.len(), 1);
+        assert_eq!(a.wallet_stats[0].unrealized_pnl, dec!(5));
+        assert!(a.wallet_stats[0].open_exposure > Decimal::ZERO);
     }
 }

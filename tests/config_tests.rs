@@ -10,7 +10,7 @@ fn load_default_config_file() {
         .expect("default config should parse");
     assert_eq!(
         config.session.starting_capital,
-        rust_decimal::Decimal::new(10_000, 0)
+        rust_decimal::Decimal::new(1_000_000, 0)
     );
     assert_eq!(config.latency.arrival_delay_ms, 500);
 }

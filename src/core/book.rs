@@ -7,6 +7,8 @@ use super::types::{BookLevel, DataQuality, TokenId};
 /// Local orderbook for a single token. Bids sorted descending, asks ascending.
 #[derive(Debug, Clone)]
 pub struct OrderBook {
+    /// Token ID this book represents. Used for snapshot matching and logging.
+    #[allow(dead_code)]
     pub token_id: TokenId,
     bids: BTreeMap<Decimal, Decimal>, // price → size
     asks: BTreeMap<Decimal, Decimal>,
@@ -80,12 +82,14 @@ impl OrderBook {
             .collect()
     }
 
-    /// Total depth on the ask side.
+    /// Total depth on the ask side. Used in tests and analytics.
+    #[allow(dead_code)]
     pub fn total_ask_depth(&self) -> Decimal {
         self.asks.values().copied().sum()
     }
 
-    /// Total depth on the bid side.
+    /// Total depth on the bid side. Used in tests and analytics.
+    #[allow(dead_code)]
     pub fn total_bid_depth(&self) -> Decimal {
         self.bids.values().copied().sum()
     }
@@ -100,6 +104,51 @@ impl OrderBook {
     /// Mark as rebuilding (e.g., after reconnect).
     pub fn mark_rebuilding(&mut self) {
         self.quality = DataQuality::Rebuilding;
+    }
+
+    /// Consume liquidity from the book to model a prior trade.
+    ///
+    /// When a tracked wallet BUYs, they consumed asks (walking up from best ask).
+    /// When they SELL, they consumed bids (walking down from best bid).
+    /// We subtract `qty` from the relevant side so our fill simulation sees
+    /// the reduced depth that would actually be available to us.
+    pub fn consume_liquidity(&mut self, side: super::types::Side, mut qty: Decimal) {
+        use super::types::Side;
+        if qty <= Decimal::ZERO {
+            return;
+        }
+
+        let levels = match side {
+            Side::Buy => &mut self.asks,  // buyer consumed asks
+            Side::Sell => &mut self.bids, // seller consumed bids
+        };
+
+        // Walk the levels and subtract qty
+        let mut to_remove = Vec::new();
+        // For asks: walk ascending (BTreeMap natural order = ascending)
+        // For bids: walk descending (best bid first)
+        let keys: Vec<Decimal> = match side {
+            Side::Buy => levels.keys().copied().collect(),
+            Side::Sell => levels.keys().rev().copied().collect(),
+        };
+
+        for price in keys {
+            if qty <= Decimal::ZERO {
+                break;
+            }
+            if let Some(size) = levels.get_mut(&price) {
+                let consumed = qty.min(*size);
+                *size -= consumed;
+                qty -= consumed;
+                if *size <= Decimal::ZERO {
+                    to_remove.push(price);
+                }
+            }
+        }
+
+        for price in to_remove {
+            levels.remove(&price);
+        }
     }
 }
 
@@ -201,6 +250,49 @@ mod tests {
         assert_eq!(book.best_bid(), Some(d("0.40")));
         assert_eq!(book.total_bid_depth(), d("50"));
         assert!(book.best_ask().is_none()); // asks cleared
+    }
+
+    #[test]
+    fn consume_liquidity_buy_removes_asks() {
+        let mut book = OrderBook::new("t1".into());
+        let asks = levels(&[("0.55", "100"), ("0.56", "200"), ("0.57", "300")]);
+        book.apply_snapshot(&[], &asks);
+
+        // A buyer consumed 150 shares: 100 at 0.55 (fully consumed) + 50 at 0.56
+        book.consume_liquidity(crate::core::types::Side::Buy, d("150"));
+
+        let lvls = book.ask_levels();
+        assert_eq!(lvls.len(), 2); // 0.55 fully consumed, removed
+        assert_eq!(lvls[0].price, d("0.56"));
+        assert_eq!(lvls[0].size, d("150")); // 200 - 50 = 150
+        assert_eq!(lvls[1].price, d("0.57"));
+        assert_eq!(lvls[1].size, d("300")); // untouched
+    }
+
+    #[test]
+    fn consume_liquidity_sell_removes_bids() {
+        let mut book = OrderBook::new("t1".into());
+        let bids = levels(&[("0.45", "100"), ("0.44", "200")]);
+        book.apply_snapshot(&bids, &[]);
+
+        // A seller consumed 100 shares from the best bid (0.45)
+        book.consume_liquidity(crate::core::types::Side::Sell, d("100"));
+
+        let lvls = book.bid_levels();
+        assert_eq!(lvls.len(), 1); // 0.45 fully consumed
+        assert_eq!(lvls[0].price, d("0.44"));
+        assert_eq!(lvls[0].size, d("200")); // untouched
+    }
+
+    #[test]
+    fn consume_more_than_available() {
+        let mut book = OrderBook::new("t1".into());
+        let asks = levels(&[("0.55", "50")]);
+        book.apply_snapshot(&[], &asks);
+
+        // Consume more than exists — should just drain the book
+        book.consume_liquidity(crate::core::types::Side::Buy, d("100"));
+        assert!(book.ask_levels().is_empty());
     }
 
     #[test]

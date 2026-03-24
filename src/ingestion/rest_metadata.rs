@@ -25,8 +25,6 @@ pub struct GammaMarket {
 pub enum MetadataError {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("parse error: {0}")]
-    Parse(String),
 }
 
 /// Fetch active markets from Gamma API and store them.

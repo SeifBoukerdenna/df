@@ -22,13 +22,16 @@ pub enum WsMarketEvent {
         token_id: TokenId,
         bids: Vec<BookLevel>,
         asks: Vec<BookLevel>,
+        #[allow(dead_code)]
         timestamp: String,
     },
     LastTradePrice {
         token_id: TokenId,
         price: Decimal,
         size: Option<Decimal>,
+        #[allow(dead_code)]
         side: Option<String>,
+        #[allow(dead_code)]
         timestamp: String,
     },
     Connected,
@@ -185,7 +188,7 @@ async fn connect_and_stream(
                         if text_str == "PONG" {
                             continue;
                         }
-                        if let Some(event) = parse_ws_message(text_str) {
+                        for event in parse_ws_message(text_str) {
                             let _ = event_tx.send(event).await;
                         }
                     }
@@ -220,25 +223,21 @@ fn build_subscribe_message(token_ids: &[TokenId]) -> String {
     .to_string()
 }
 
-fn parse_ws_message(text: &str) -> Option<WsMarketEvent> {
+/// Parse a WS message into all contained events.
+/// Polymarket sends arrays — we must process ALL events, not just the first.
+fn parse_ws_message(text: &str) -> Vec<WsMarketEvent> {
     // Polymarket sends arrays of events
     if let Ok(messages) = serde_json::from_str::<Vec<WsRawMessage>>(text) {
-        // Return the first parseable event (they typically send one per message)
-        for msg in messages {
-            if let Some(event) = parse_single_message(&msg) {
-                return Some(event);
-            }
-        }
-        return None;
+        return messages.iter().filter_map(parse_single_message).collect();
     }
 
     // Try single message
     if let Ok(msg) = serde_json::from_str::<WsRawMessage>(text) {
-        return parse_single_message(&msg);
+        return parse_single_message(&msg).into_iter().collect();
     }
 
     debug!(raw = text, "unparseable WebSocket message");
-    None
+    Vec::new()
 }
 
 fn parse_single_message(msg: &WsRawMessage) -> Option<WsMarketEvent> {
@@ -303,8 +302,9 @@ mod tests {
             "asks": [{"price": "0.55", "size": "150"}],
             "timestamp": "1234567890"
         }]"#;
-        let event = parse_ws_message(json).unwrap();
-        match event {
+        let events = parse_ws_message(json);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             WsMarketEvent::BookSnapshot {
                 token_id,
                 bids,
@@ -330,8 +330,9 @@ mod tests {
             "side": "BUY",
             "timestamp": "1234567890"
         }]"#;
-        let event = parse_ws_message(json).unwrap();
-        match event {
+        let events = parse_ws_message(json);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             WsMarketEvent::LastTradePrice {
                 token_id,
                 price,
@@ -339,8 +340,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(token_id, "12345");
-                assert_eq!(price, Decimal::new(50, 2));
-                assert_eq!(size, Some(Decimal::new(25, 0)));
+                assert_eq!(price, &Decimal::new(50, 2));
+                assert_eq!(size, &Some(Decimal::new(25, 0)));
             }
             _ => panic!("expected LastTradePrice"),
         }
@@ -348,14 +349,47 @@ mod tests {
 
     #[test]
     fn parse_pong_ignored() {
-        let event = parse_ws_message("PONG");
-        assert!(event.is_none());
+        let events = parse_ws_message("PONG");
+        assert!(events.is_empty());
     }
 
     #[test]
     fn parse_empty_array() {
-        let event = parse_ws_message("[]");
-        assert!(event.is_none());
+        let events = parse_ws_message("[]");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_multi_event_array() {
+        // Polymarket can send multiple events in a single array.
+        // Previously only the first was processed — this test ensures ALL are parsed.
+        let json = r#"[
+            {
+                "event_type": "book",
+                "asset_id": "token_a",
+                "bids": [{"price": "0.40", "size": "50"}],
+                "asks": [{"price": "0.60", "size": "50"}],
+                "timestamp": "100"
+            },
+            {
+                "event_type": "book",
+                "asset_id": "token_b",
+                "bids": [{"price": "0.30", "size": "80"}],
+                "asks": [{"price": "0.70", "size": "80"}],
+                "timestamp": "101"
+            },
+            {
+                "event_type": "last_trade_price",
+                "asset_id": "token_c",
+                "price": "0.55",
+                "timestamp": "102"
+            }
+        ]"#;
+        let events = parse_ws_message(json);
+        assert_eq!(events.len(), 3, "all 3 events in the array must be parsed");
+        assert!(matches!(&events[0], WsMarketEvent::BookSnapshot { token_id, .. } if token_id == "token_a"));
+        assert!(matches!(&events[1], WsMarketEvent::BookSnapshot { token_id, .. } if token_id == "token_b"));
+        assert!(matches!(&events[2], WsMarketEvent::LastTradePrice { token_id, .. } if token_id == "token_c"));
     }
 
     #[test]

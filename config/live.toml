@@ -1,0 +1,43 @@
+# df — Live run configuration (overrides default.toml)
+# Usage: df run --config config/live.toml
+
+[session]
+starting_capital = "1000000"
+max_position_fraction = "0.50"
+max_slippage_bps = "300"
+marking_mode = "conservative"
+
+[wallets]
+directional_file = "config/tracked_wallets/directional_wallets.toml"
+arbitrage_file = "config/tracked_wallets/arbitrage_wallets.toml"
+
+[latency]
+polling_mode = "aggressive"
+arrival_delay_ms = 500
+directional_interval_ms = 2000
+arbitrage_interval_ms = 1500
+
+[fees]
+cache_ttl_secs = 3600
+unavailable_policy = "skip"
+
+[ingestion]
+metadata_refresh_secs = 300
+stale_threshold_secs = 30
+market_prune_secs = 1800
+
+[storage]
+db_path = "data/df.db"
+snapshot_interval_secs = 60
+sessions_dir = "sessions"
+
+[reporting]
+mark_interval_secs = 5
+
+[category.directional]
+max_slippage_bps = "500"
+
+[category.arbitrage]
+max_slippage_bps = "200"
+max_position_fraction = "0.05"
+max_detection_age_ms = 10000

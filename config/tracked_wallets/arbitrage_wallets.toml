@@ -1,0 +1,43 @@
+# Arbitrage wallets — structural inefficiency exploiters
+# NOTE: With REST polling (~30s detection lag), arbitrage copying is structurally
+# disadvantaged. These wallets are tracked for research, not expected profitability.
+
+[[wallet]]
+address = "0x63ce342161250d705dc0b16df89036c8e5f9ba9a"
+name = "arb-01"
+
+[[wallet]]
+address = "0x297fbd45782af37d899015aebbc52437f3d55103"
+name = "arb-02"
+
+[[wallet]]
+address = "0x20ad75e19b155f8518eb9e0486158f9884879c9a"
+name = "arb-03"
+
+[[wallet]]
+address = "0xd0d6053c3c37e727402d84c14069780d360993aa"
+name = "arb-04"
+
+[[wallet]]
+address = "0x0006af12cd4dacc450836a0e1ec6ce47365d8c63"
+name = "arb-05"
+
+[[wallet]]
+address = "0xde17f7144fbd0eddb2679132c10ff5e74b120988"
+name = "arb-06"
+
+[[wallet]]
+address = "0x52fdda3e1f0aa2f4a667afb0d6ad5343b4644132"
+name = "arb-07"
+
+[[wallet]]
+address = "0xf6963d4cdbb6f26d753bda303e9513132afb1b7d"
+name = "arb-08"
+
+[[wallet]]
+address = "0xa47fe9ae3f40f50955e6fbb24f7eb2392e6cc8f6"
+name = "arb-09"
+
+[[wallet]]
+address = "0x70ec235a31eb35f243e2618d6ea3b5b8962bbb5d"
+name = "arb-10"

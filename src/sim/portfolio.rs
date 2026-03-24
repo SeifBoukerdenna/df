@@ -200,6 +200,100 @@ impl Portfolio {
         total
     }
 
+    /// Compute unrealized PnL with estimated exit fees deducted.
+    /// This is a more conservative and truthful metric — it answers
+    /// "what would I actually keep if I exited all positions now?"
+    pub fn unrealized_pnl_after_fees(
+        &self,
+        books: &HashMap<TokenId, OrderBook>,
+        marking_mode: MarkingMode,
+        fee_store: Option<&crate::storage::db::Store>,
+    ) -> Decimal {
+        let mut total = Decimal::ZERO;
+        for (token_id, pos) in &self.positions {
+            let mark_price = match books.get(token_id) {
+                Some(book) => match marking_mode {
+                    MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
+                    MarkingMode::Midpoint => book.midpoint().unwrap_or(Decimal::ZERO),
+                    MarkingMode::LastTrade => {
+                        book.last_trade_price.unwrap_or(Decimal::ZERO)
+                    }
+                },
+                None => Decimal::ZERO,
+            };
+            let market_value = pos.qty * mark_price;
+            let raw_unrealized = market_value - pos.cost_basis;
+
+            // Estimate exit fee using the same Polymarket formula
+            let exit_fee = if let Some(store) = fee_store {
+                let cached = store.get_cached_fee_any_age(token_id);
+                if let Ok(Some(rate_str)) = cached {
+                    if let Ok(rate) = rate_str.parse::<Decimal>() {
+                        crate::core::fees::calculate_fee(pos.qty, mark_price, rate)
+                    } else {
+                        Decimal::ZERO
+                    }
+                } else {
+                    Decimal::ZERO
+                }
+            } else {
+                Decimal::ZERO
+            };
+
+            total += raw_unrealized - exit_fee;
+        }
+        total
+    }
+
+    /// Compute per-position unrealized PnL keyed by source_wallet.
+    /// Returns (wallet_addr -> unrealized_pnl) for report display.
+    pub fn unrealized_by_wallet(
+        &self,
+        books: &HashMap<TokenId, OrderBook>,
+        marking_mode: MarkingMode,
+    ) -> HashMap<WalletAddr, Decimal> {
+        let mut by_wallet: HashMap<WalletAddr, Decimal> = HashMap::new();
+        for (token_id, pos) in &self.positions {
+            let mark_price = match books.get(token_id) {
+                Some(book) => match marking_mode {
+                    MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
+                    MarkingMode::Midpoint => book.midpoint().unwrap_or(Decimal::ZERO),
+                    MarkingMode::LastTrade => {
+                        book.last_trade_price.unwrap_or(Decimal::ZERO)
+                    }
+                },
+                None => Decimal::ZERO,
+            };
+            let unrealized = pos.qty * mark_price - pos.cost_basis;
+            *by_wallet.entry(pos.source_wallet.clone()).or_default() += unrealized;
+        }
+        by_wallet
+    }
+
+    /// Compute per-position open exposure keyed by source_wallet.
+    /// Returns (wallet_addr -> market_value) of open positions.
+    pub fn exposure_by_wallet(
+        &self,
+        books: &HashMap<TokenId, OrderBook>,
+        marking_mode: MarkingMode,
+    ) -> HashMap<WalletAddr, Decimal> {
+        let mut by_wallet: HashMap<WalletAddr, Decimal> = HashMap::new();
+        for (token_id, pos) in &self.positions {
+            let mark_price = match books.get(token_id) {
+                Some(book) => match marking_mode {
+                    MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
+                    MarkingMode::Midpoint => book.midpoint().unwrap_or(Decimal::ZERO),
+                    MarkingMode::LastTrade => {
+                        book.last_trade_price.unwrap_or(Decimal::ZERO)
+                    }
+                },
+                None => Decimal::ZERO,
+            };
+            *by_wallet.entry(pos.source_wallet.clone()).or_default() += pos.qty * mark_price;
+        }
+        by_wallet
+    }
+
     /// Compute total market value of open positions.
     pub fn market_value(
         &self,
@@ -286,7 +380,8 @@ impl Portfolio {
         serde_json::to_string(self)
     }
 
-    /// Deserialize from JSON snapshot.
+    /// Deserialize from JSON snapshot. Used for replay/recovery.
+    #[allow(dead_code)]
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
@@ -299,7 +394,7 @@ mod tests {
     use crate::core::types::{BookLevel, DataQuality, FillResult, LatencyComponents, Side};
     use rust_decimal_macros::dec;
 
-    fn make_fill(side: Side, qty: Decimal, price: Decimal, fee: Decimal) -> FillOutput {
+    fn make_fill(_side: Side, qty: Decimal, price: Decimal, fee: Decimal) -> FillOutput {
         let cost = qty * price;
         FillOutput {
             result: FillResult::Full,

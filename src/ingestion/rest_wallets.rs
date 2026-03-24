@@ -45,7 +45,9 @@ pub struct PollCycleMetrics {
 /// Raw trade response from Polymarket Data API.
 #[derive(Debug, Deserialize)]
 struct DataApiTrade {
+    /// Proxy wallet address — present in API response, used for deserialization.
     #[serde(rename = "proxyWallet")]
+    #[allow(dead_code)]
     proxy_wallet: Option<String>,
     #[serde(rename = "conditionId")]
     condition_id: Option<String>,
@@ -306,6 +308,9 @@ async fn poll_category_loop(
                         let wallet_info = TrackedWallet {
                             address: wm.address.clone(),
                             category: wm.category,
+                            name: None,
+                            profile_url: None,
+                            notes: None,
                         };
                         let Some(detected) = parse_raw_trade(raw, &wallet_info) else {
                             continue;
@@ -597,6 +602,9 @@ mod tests {
         let wallet = TrackedWallet {
             address: "0xwallet".into(),
             category: WalletCategory::Directional,
+            name: None,
+            profile_url: None,
+            notes: None,
         };
         let detected = parse_raw_trade(&raw, &wallet).unwrap();
         assert_eq!(detected.wallet, "0xwallet");
@@ -620,6 +628,9 @@ mod tests {
         let wallet = TrackedWallet {
             address: "0x".into(),
             category: WalletCategory::Arbitrage,
+            name: None,
+            profile_url: None,
+            notes: None,
         };
         assert!(parse_raw_trade(&raw, &wallet).is_none());
     }

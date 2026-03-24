@@ -1,3 +1,4 @@
+pub mod onchain;
 pub mod rest_book;
 pub mod rest_metadata;
 pub mod rest_wallets;

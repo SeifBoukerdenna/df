@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::config::schema::AppConfig;
+use crate::config::wallets;
 use crate::report::analytics;
 use crate::report::html;
 use crate::storage::db::Store;
@@ -40,10 +41,24 @@ pub fn execute(session_id: Option<String>, config_path: &PathBuf) {
         },
     };
 
+    let loaded_wallets = wallets::load_wallets(
+        &config.wallets.directional_file,
+        &config.wallets.arbitrage_file,
+    )
+    .unwrap_or_else(|_| Vec::new());
+    let wallet_names = wallets::build_wallet_name_map(&loaded_wallets);
+    let wallet_profiles = wallets::build_wallet_profile_map(&loaded_wallets);
+
+    // Cold report: no live portfolio state.
+    // Unrealized PnL will show as "N/A" in the report.
+    // For live unrealized, generate the report from `df run` at session end.
     let a = match analytics::compute_analytics(
         &store,
         &session,
         config.session.starting_capital,
+        &wallet_names,
+        &wallet_profiles,
+        None, // no live state for cold reports
     ) {
         Ok(a) => a,
         Err(e) => {

@@ -39,7 +39,11 @@ pub fn execute(config_path: &PathBuf, check: bool) {
     if !directional.is_empty() {
         println!("Directional ({}):", directional.len());
         for w in &directional {
-            println!("  {}", w.address);
+            let name_str = w.name.as_deref().unwrap_or("—");
+            println!("  {} ({})", w.address, name_str);
+            if let Some(ref url) = w.profile_url {
+                println!("    profile: {url}");
+            }
         }
         println!();
     }
@@ -47,12 +51,16 @@ pub fn execute(config_path: &PathBuf, check: bool) {
     if !arbitrage.is_empty() {
         println!("Arbitrage ({}):", arbitrage.len());
         for w in &arbitrage {
-            println!("  {}", w.address);
+            let name_str = w.name.as_deref().unwrap_or("—");
+            println!("  {} ({})", w.address, name_str);
+            if let Some(ref url) = w.profile_url {
+                println!("    profile: {url}");
+            }
         }
         println!();
     }
 
     if check {
-        println!("Wallet validation: all {} addresses pass format checks (0x-prefixed, 42 chars, valid hex).", loaded.len());
+        println!("Wallet validation: all {} addresses pass format checks.", loaded.len());
     }
 }

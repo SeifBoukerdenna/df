@@ -52,6 +52,8 @@ pub enum MissReason {
     NoSessionPosition,
     InsufficientCapital,
     Degraded,
+    /// Trade detected too long after execution — stale for this category's latency budget.
+    DetectionTooOld,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

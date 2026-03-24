@@ -21,20 +21,104 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub reporting: ReportingConfig,
+    /// Category-specific overrides. Missing = use session defaults.
+    #[serde(default)]
+    pub category: CategoryConfigs,
+}
+
+/// Per-category configuration overrides.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CategoryConfigs {
+    #[serde(default)]
+    pub directional: Option<CategoryOverrides>,
+    #[serde(default)]
+    pub arbitrage: Option<CategoryOverrides>,
+}
+
+/// Category-specific overrides — any field set here takes precedence over session defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryOverrides {
+    /// Max slippage in bps for this category.
+    pub max_slippage_bps: Option<Decimal>,
+    /// Max position fraction for this category.
+    pub max_position_fraction: Option<Decimal>,
+    /// Arrival delay override in ms.
+    pub arrival_delay_ms: Option<u64>,
+    /// Max detection age in ms — skip trades older than this (realism guard).
+    /// Default: None (no limit). Arbitrage should be tight (e.g., 10000ms).
+    pub max_detection_age_ms: Option<u64>,
+    /// Fee unavailable policy override for this category.
+    pub fee_unavailable_policy: Option<FeeUnavailablePolicy>,
+}
+
+impl AppConfig {
+    /// Get effective max_slippage_bps for a category.
+    pub fn max_slippage_for(&self, cat: crate::core::types::WalletCategory) -> Decimal {
+        use crate::core::types::WalletCategory;
+        let overrides = match cat {
+            WalletCategory::Directional => self.category.directional.as_ref(),
+            WalletCategory::Arbitrage => self.category.arbitrage.as_ref(),
+        };
+        overrides
+            .and_then(|o| o.max_slippage_bps)
+            .unwrap_or(self.session.max_slippage_bps)
+    }
+
+    /// Get effective max_position_fraction for a category.
+    pub fn max_position_fraction_for(&self, cat: crate::core::types::WalletCategory) -> Decimal {
+        use crate::core::types::WalletCategory;
+        let overrides = match cat {
+            WalletCategory::Directional => self.category.directional.as_ref(),
+            WalletCategory::Arbitrage => self.category.arbitrage.as_ref(),
+        };
+        overrides
+            .and_then(|o| o.max_position_fraction)
+            .unwrap_or(self.session.max_position_fraction)
+    }
+
+    /// Get effective arrival_delay_ms for a category.
+    pub fn arrival_delay_for(&self, cat: crate::core::types::WalletCategory) -> u64 {
+        use crate::core::types::WalletCategory;
+        let overrides = match cat {
+            WalletCategory::Directional => self.category.directional.as_ref(),
+            WalletCategory::Arbitrage => self.category.arbitrage.as_ref(),
+        };
+        overrides
+            .and_then(|o| o.arrival_delay_ms)
+            .unwrap_or(self.latency.arrival_delay_ms)
+    }
+
+    /// Get max_detection_age_ms for a category (None = no limit).
+    pub fn max_detection_age_for(&self, cat: crate::core::types::WalletCategory) -> Option<u64> {
+        use crate::core::types::WalletCategory;
+        let overrides = match cat {
+            WalletCategory::Directional => self.category.directional.as_ref(),
+            WalletCategory::Arbitrage => self.category.arbitrage.as_ref(),
+        };
+        overrides.and_then(|o| o.max_detection_age_ms)
+    }
+
+    /// Get fee_unavailable_policy for a category.
+    pub fn fee_policy_for(&self, cat: crate::core::types::WalletCategory) -> FeeUnavailablePolicy {
+        use crate::core::types::WalletCategory;
+        let overrides = match cat {
+            WalletCategory::Directional => self.category.directional.as_ref(),
+            WalletCategory::Arbitrage => self.category.arbitrage.as_ref(),
+        };
+        overrides
+            .and_then(|o| o.fee_unavailable_policy)
+            .unwrap_or(self.fees.unavailable_policy)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Starting capital in USDC.
     #[serde(default = "default_starting_capital")]
     pub starting_capital: Decimal,
-    /// Maximum fraction of capital to allocate to a single copy trade.
     #[serde(default = "default_max_position_fraction")]
     pub max_position_fraction: Decimal,
-    /// Maximum slippage in bps before a fill is skipped.
     #[serde(default = "default_max_slippage_bps")]
     pub max_slippage_bps: Decimal,
-    /// How to value open positions for unrealized PnL.
     #[serde(default)]
     pub marking_mode: MarkingMode,
 }
@@ -52,10 +136,8 @@ impl Default for SessionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletConfig {
-    /// Path to directional wallets file.
     #[serde(default = "default_directional_path")]
     pub directional_file: PathBuf,
-    /// Path to arbitrage wallets file.
     #[serde(default = "default_arbitrage_path")]
     pub arbitrage_file: PathBuf,
 }
@@ -69,21 +151,14 @@ impl Default for WalletConfig {
     }
 }
 
-/// Latency model — each component is explicit and independently configurable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyConfig {
-    /// How often we poll for wallet trades. Determines detection delay floor.
     #[serde(default)]
     pub polling_mode: PollingMode,
-    /// Additional simulated arrival delay in ms (models our order reaching the exchange).
     #[serde(default = "default_arrival_delay_ms")]
     pub arrival_delay_ms: u64,
-    /// Polling interval override for directional wallets in ms.
-    /// Defaults: baseline=5000, aggressive=2000.
     #[serde(default)]
     pub directional_interval_ms: Option<u64>,
-    /// Polling interval override for arbitrage wallets in ms.
-    /// Defaults: baseline=5000, aggressive=5000.
     #[serde(default)]
     pub arbitrage_interval_ms: Option<u64>,
 }
@@ -101,11 +176,8 @@ impl Default for LatencyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeConfig {
-    /// TTL for cached fee rates in seconds.
     #[serde(default = "default_fee_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
-    /// What to do when fee data is unavailable and no cache exists.
-    /// "skip" = miss the trade (default, honest). "degrade" = fill with zero fee, mark degraded.
     #[serde(default = "default_fee_unavailable_policy")]
     pub unavailable_policy: FeeUnavailablePolicy,
 }
@@ -121,15 +193,18 @@ impl Default for FeeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestionConfig {
-    /// Interval in seconds between market metadata refreshes.
     #[serde(default = "default_metadata_refresh_secs")]
     pub metadata_refresh_secs: u64,
-    /// Seconds of book silence before marking a token as stale.
     #[serde(default = "default_stale_threshold_secs")]
     pub stale_threshold_secs: u64,
-    /// Seconds of inactivity before unsubscribing from a market's book data.
     #[serde(default = "default_market_prune_secs")]
     pub market_prune_secs: u64,
+    /// Optional Polygon WebSocket RPC URL for on-chain trade detection.
+    /// Enables ~2-4s detection latency via OrderFilled events.
+    /// Example: "wss://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    /// If not set, falls back to REST Data API polling (~10-30s).
+    #[serde(default)]
+    pub polygon_rpc_ws: Option<String>,
 }
 
 impl Default for IngestionConfig {
@@ -138,19 +213,17 @@ impl Default for IngestionConfig {
             metadata_refresh_secs: default_metadata_refresh_secs(),
             stale_threshold_secs: default_stale_threshold_secs(),
             market_prune_secs: default_market_prune_secs(),
+            polygon_rpc_ws: None,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Path to the SQLite database file.
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
-    /// Interval in seconds between automatic snapshots.
     #[serde(default = "default_snapshot_interval_secs")]
     pub snapshot_interval_secs: u64,
-    /// Directory for session outputs (HTML reports, etc.).
     #[serde(default = "default_sessions_dir")]
     pub sessions_dir: PathBuf,
 }
@@ -167,7 +240,6 @@ impl Default for StorageConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportingConfig {
-    /// Mark-to-market interval in seconds for live unrealized PnL updates.
     #[serde(default = "default_mark_interval_secs")]
     pub mark_interval_secs: u64,
 }
@@ -183,7 +255,7 @@ impl Default for ReportingConfig {
 // --- Default value functions ---
 
 fn default_starting_capital() -> Decimal {
-    Decimal::new(10_000, 0) // $10,000
+    Decimal::new(10_000, 0)
 }
 
 fn default_max_position_fraction() -> Decimal {
@@ -191,7 +263,7 @@ fn default_max_position_fraction() -> Decimal {
 }
 
 fn default_max_slippage_bps() -> Decimal {
-    Decimal::new(200, 0) // 200 bps
+    Decimal::new(300, 0) // 300 bps
 }
 
 fn default_directional_path() -> PathBuf {
@@ -207,11 +279,11 @@ fn default_arrival_delay_ms() -> u64 {
 }
 
 fn default_fee_cache_ttl_secs() -> u64 {
-    3600 // 1 hour
+    3600
 }
 
 fn default_metadata_refresh_secs() -> u64 {
-    300 // 5 minutes
+    300
 }
 
 fn default_stale_threshold_secs() -> u64 {
@@ -219,7 +291,7 @@ fn default_stale_threshold_secs() -> u64 {
 }
 
 fn default_market_prune_secs() -> u64 {
-    1800 // 30 minutes
+    1800
 }
 
 fn default_fee_unavailable_policy() -> FeeUnavailablePolicy {
@@ -258,7 +330,6 @@ pub enum ConfigError {
 }
 
 impl AppConfig {
-    /// Load from a TOML file. If the path doesn't exist, returns defaults.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         if !path.exists() {
             return Ok(Self::default());
@@ -273,7 +344,6 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Load defaults (no file).
     pub fn default() -> Self {
         Self {
             session: SessionConfig::default(),
@@ -283,6 +353,7 @@ impl AppConfig {
             ingestion: IngestionConfig::default(),
             storage: StorageConfig::default(),
             reporting: ReportingConfig::default(),
+            category: CategoryConfigs::default(),
         }
     }
 
@@ -305,5 +376,48 @@ impl AppConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        let config = AppConfig::default();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn category_overrides_work() {
+        use crate::core::types::WalletCategory;
+        let mut config = AppConfig::default();
+        config.category.arbitrage = Some(CategoryOverrides {
+            max_slippage_bps: Some(Decimal::new(100, 0)),
+            max_position_fraction: Some(Decimal::new(5, 2)),
+            arrival_delay_ms: Some(200),
+            max_detection_age_ms: Some(10_000),
+            fee_unavailable_policy: None,
+        });
+
+        assert_eq!(
+            config.max_slippage_for(WalletCategory::Arbitrage),
+            Decimal::new(100, 0)
+        );
+        assert_eq!(
+            config.max_slippage_for(WalletCategory::Directional),
+            Decimal::new(300, 0) // session default
+        );
+        assert_eq!(config.arrival_delay_for(WalletCategory::Arbitrage), 200);
+        assert_eq!(config.arrival_delay_for(WalletCategory::Directional), 500);
+        assert_eq!(
+            config.max_detection_age_for(WalletCategory::Arbitrage),
+            Some(10_000)
+        );
+        assert_eq!(
+            config.max_detection_age_for(WalletCategory::Directional),
+            None
+        );
     }
 }
