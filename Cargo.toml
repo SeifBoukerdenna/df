@@ -1,0 +1,30 @@
+[package]
+name = "df"
+version = "0.1.0"
+edition = "2024"
+description = "Polymarket paper-trading copy engine"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1", features = ["full"] }
+
+# Phase 2: Storage
+rusqlite = { version = "0.35", features = ["bundled"] }
+
+# Phase 3-4: Ingestion
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+rust_decimal_macros = "1"

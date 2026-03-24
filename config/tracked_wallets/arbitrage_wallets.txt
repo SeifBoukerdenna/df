@@ -1,0 +1,14 @@
+# Arbitrage wallets — one address per line
+# These wallets are expected to exploit structural inefficiencies.
+#
+# Add 0x-prefixed Ethereum addresses below:
+0x63ce342161250d705dc0b16df89036c8e5f9ba9a
+0x297fbd45782af37d899015aebbc52437f3d55103
+0x20ad75e19b155f8518eb9e0486158f9884879c9a
+0xd0d6053c3c37e727402d84c14069780d360993aa
+0x0006af12cd4dacc450836a0e1ec6ce47365d8c63
+0xde17f7144fbd0eddb2679132c10ff5e74b120988
+0x52fdda3e1f0aa2f4a667afb0d6ad5343b4644132
+0xf6963d4cdbb6f26d753bda303e9513132afb1b7d
+0xa47fe9ae3f40f50955e6fbb24f7eb2392e6cc8f6
+0x70ec235a31eb35f243e2618d6ea3b5b8962bbb5d
