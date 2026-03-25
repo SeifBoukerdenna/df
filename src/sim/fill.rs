@@ -318,6 +318,9 @@ fn capital_limited_fill(levels: &[BookLevel], max_cost: Decimal) -> WalkResult {
 }
 
 /// Compute slippage in basis points between our avg price and the reference price.
+/// Positive = we got worse price than source wallet (cost of latency/liquidity).
+/// Negative = we got better price than source wallet (price improvement).
+/// Both are reported honestly. The fill check at line 139 rejects only positive > max.
 fn compute_slippage_bps(our_price: Decimal, reference_price: Decimal, side: Side) -> Decimal {
     if reference_price == Decimal::ZERO {
         return Decimal::ZERO;
@@ -328,7 +331,7 @@ fn compute_slippage_bps(our_price: Decimal, reference_price: Decimal, side: Side
     };
     ((diff / reference_price) * Decimal::new(10_000, 0))
         .round_dp(2)
-        .max(Decimal::ZERO)
+    // No .max(0) — negative slippage (price improvement) is real and should be visible.
 }
 
 fn sell_actionability(request: &FillRequest) -> Option<ExitActionability> {
@@ -560,6 +563,14 @@ mod tests {
         // No slippage
         let bps = compute_slippage_bps(dec!(0.50), dec!(0.50), Side::Buy);
         assert_eq!(bps, dec!(0.00));
+
+        // Negative slippage (price improvement): we bought cheaper than source wallet
+        let bps = compute_slippage_bps(dec!(0.48), dec!(0.50), Side::Buy);
+        assert_eq!(bps, dec!(-400.00));
+
+        // Negative slippage on sell: we sold higher than source wallet
+        let bps = compute_slippage_bps(dec!(0.55), dec!(0.50), Side::Sell);
+        assert_eq!(bps, dec!(-1000.00));
     }
 
     #[test]

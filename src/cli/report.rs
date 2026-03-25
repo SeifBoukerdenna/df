@@ -59,6 +59,7 @@ pub fn execute(session_id: Option<String>, config_path: &PathBuf) {
         &wallet_names,
         &wallet_profiles,
         None, // no live state for cold reports
+        Vec::new(), // no timeline for cold reports
     ) {
         Ok(a) => a,
         Err(e) => {

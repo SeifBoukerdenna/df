@@ -61,7 +61,7 @@ struct DataApiTrade {
 }
 
 /// Shared state for deduplication across all wallet pollers.
-struct DeduplicationState {
+pub(crate) struct DeduplicationState {
     seen_tx_hashes: HashSet<String>,
     seen_tx_order: VecDeque<String>,
 }
@@ -97,7 +97,10 @@ impl DeduplicationState {
 struct WalletWatermark {
     address: WalletAddr,
     category: WalletCategory,
+    /// Hash of the newest trade seen (for watermark comparison).
     last_seen_tx: Option<String>,
+    /// Timestamp of the newest trade seen (for backup ordering).
+    last_seen_ts: Option<i64>,
     consecutive_errors: u32,
 }
 
@@ -229,6 +232,7 @@ async fn poll_category_loop(
             address: w.address.clone(),
             category: w.category,
             last_seen_tx: None,
+            last_seen_ts: None,
             consecutive_errors: 0,
         })
         .collect();
@@ -281,29 +285,32 @@ async fn poll_category_loop(
                 Ok(trades) => {
                     wm.consecutive_errors = 0;
 
-                    // Find new trades
-                    let new_trades = find_new_trades(&trades, &wm.last_seen_tx);
+                    // Lock dedup for the entire new-trade detection + marking pass
+                    let mut dd = dedup.lock().await;
 
-                    // Update watermark
-                    if let Some(newest_tx) =
-                        trades.first().and_then(|t| t.transaction_hash.clone())
-                    {
-                        wm.last_seen_tx = Some(newest_tx);
+                    // Find new trades using both tx watermark and timestamp watermark
+                    let new_trades = find_new_trades(&trades, &wm.last_seen_tx, wm.last_seen_ts, &dd);
+
+                    // Update watermark (tx hash + timestamp)
+                    if let Some(newest) = trades.first() {
+                        if let Some(tx) = newest.transaction_hash.clone() {
+                            wm.last_seen_tx = Some(tx);
+                        }
+                        if let Some(ts) = newest.timestamp {
+                            wm.last_seen_ts = Some(ts);
+                        }
                     }
 
+                    // Process new trades: mark seen and parse while holding lock
+                    let mut detected_trades = Vec::new();
                     for raw in new_trades {
                         let Some(tx_hash) = &raw.transaction_hash else {
                             continue;
                         };
-
-                        // Dedup
-                        {
-                            let mut dd = dedup.lock().await;
-                            if dd.is_seen(tx_hash) {
-                                continue;
-                            }
-                            dd.mark_seen(tx_hash.clone());
+                        if dd.is_seen(tx_hash) {
+                            continue;
                         }
+                        dd.mark_seen(tx_hash.clone());
 
                         let wallet_info = TrackedWallet {
                             address: wm.address.clone(),
@@ -312,11 +319,16 @@ async fn poll_category_loop(
                             profile_url: None,
                             notes: None,
                         };
-                        let Some(detected) = parse_raw_trade(raw, &wallet_info) else {
-                            continue;
-                        };
+                        if let Some(detected) = parse_raw_trade(raw, &wallet_info) {
+                            detected_trades.push(detected);
+                        }
+                    }
 
-                        // Notify about new market/token if not already tracking
+                    // Drop dedup lock before sending to channels
+                    drop(dd);
+
+                    // Send detected trades
+                    for detected in detected_trades {
                         {
                             let mut seen = seen_tokens.lock().await;
                             if seen.insert(detected.token_id.clone()) {
@@ -473,7 +485,9 @@ async fn poll_wallet(
     client: &reqwest::Client,
     address: &str,
 ) -> Result<Vec<DataApiTrade>, reqwest::Error> {
-    let url = format!("{DATA_API_BASE}/trades?user={address}&limit=25");
+    // Use limit=100 to avoid missing trades in bursts.
+    // With 1.5s polling, a wallet would need 100+ trades in 1.5s to overflow.
+    let url = format!("{DATA_API_BASE}/trades?user={address}&limit=100");
     let trades: Vec<DataApiTrade> = client
         .get(&url)
         .timeout(Duration::from_secs(10))
@@ -484,21 +498,47 @@ async fn poll_wallet(
     Ok(trades)
 }
 
+/// Find trades newer than our watermark. Uses both tx_hash and timestamp
+/// to avoid missing trades if the API returns results out of order.
 fn find_new_trades<'a>(
     trades: &'a [DataApiTrade],
     last_seen_tx: &Option<String>,
+    last_seen_ts: Option<i64>,
+    dedup: &crate::ingestion::rest_wallets::DeduplicationState,
 ) -> Vec<&'a DataApiTrade> {
-    let Some(last_tx) = last_seen_tx else {
+    let Some(_last_tx) = last_seen_tx else {
         // First poll — don't emit historical trades, just set the watermark.
         return Vec::new();
     };
 
-    // Trades are returned newest first. Collect all trades newer than last_seen_tx.
+    // Collect ALL trades that are either:
+    // 1. Newer than our timestamp watermark, OR
+    // 2. Not yet seen in the dedup set (catches out-of-order delivery)
+    // This is more robust than the old "stop at last_seen_tx" approach.
     let mut new_trades = Vec::new();
     for t in trades {
-        if t.transaction_hash.as_deref() == Some(last_tx.as_str()) {
-            break;
+        let tx = match t.transaction_hash.as_deref() {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // Already processed via dedup
+        if dedup.is_seen(tx) {
+            continue;
         }
+
+        // If we have a timestamp watermark, use it as a secondary filter.
+        // Accept trades with timestamp >= last_seen_ts (could be same-second trades).
+        if let Some(wm_ts) = last_seen_ts {
+            if let Some(trade_ts) = t.timestamp {
+                if trade_ts < wm_ts {
+                    // Trade is older than our watermark — skip it.
+                    // This handles the case where old trades appear in the response.
+                    continue;
+                }
+            }
+        }
+
         new_trades.push(t);
     }
     new_trades
@@ -554,13 +594,16 @@ mod tests {
 
     #[test]
     fn find_new_trades_first_poll() {
+        let dd = DeduplicationState::new();
         let trades = vec![make_trade(Some("0xaaa"))];
-        let new = find_new_trades(&trades, &None);
+        let new = find_new_trades(&trades, &None, None, &dd);
         assert!(new.is_empty(), "first poll should not emit trades");
     }
 
     #[test]
     fn find_new_trades_with_watermark() {
+        let mut dd = DeduplicationState::new();
+        dd.mark_seen("0xold".into()); // already seen
         let trades = vec![
             DataApiTrade {
                 proxy_wallet: None,
@@ -570,21 +613,65 @@ mod tests {
                 price: Some(0.5),
                 size: Some(10.0),
                 transaction_hash: Some("0xnew".into()),
+                timestamp: Some(1700000001),
+            },
+            DataApiTrade {
+                proxy_wallet: None,
+                condition_id: None,
+                asset: None,
+                side: None,
+                price: None,
+                size: None,
+                transaction_hash: Some("0xold".into()),
                 timestamp: Some(1700000000),
             },
-            make_trade(Some("0xold")),
-            make_trade(Some("0xolder")),
         ];
-        let new = find_new_trades(&trades, &Some("0xold".into()));
+        let new = find_new_trades(&trades, &Some("0xold".into()), Some(1700000000), &dd);
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].transaction_hash.as_deref(), Some("0xnew"));
     }
 
     #[test]
     fn find_new_trades_no_change() {
+        let mut dd = DeduplicationState::new();
+        dd.mark_seen("0xaaa".into());
         let trades = vec![make_trade(Some("0xaaa"))];
-        let new = find_new_trades(&trades, &Some("0xaaa".into()));
+        let new = find_new_trades(&trades, &Some("0xaaa".into()), None, &dd);
         assert!(new.is_empty());
+    }
+
+    #[test]
+    fn find_new_trades_out_of_order_recovery() {
+        // Simulates API returning trades out of order — the timestamp-based
+        // watermark catches trades that tx-hash-only watermark would miss.
+        let mut dd = DeduplicationState::new();
+        dd.mark_seen("0xtx_c".into()); // watermark was set to tx_c
+
+        let trades = vec![
+            DataApiTrade {
+                proxy_wallet: None, condition_id: None,
+                asset: Some("tok".into()), side: Some("BUY".into()),
+                price: Some(0.5), size: Some(10.0),
+                transaction_hash: Some("0xtx_d".into()),
+                timestamp: Some(1700000003),
+            },
+            DataApiTrade {
+                proxy_wallet: None, condition_id: None,
+                asset: Some("tok".into()), side: Some("SELL".into()),
+                price: Some(0.6), size: Some(5.0),
+                transaction_hash: Some("0xtx_b_late".into()), // arrived late, same timestamp as c
+                timestamp: Some(1700000002),
+            },
+        ];
+
+        let new = find_new_trades(
+            &trades,
+            &Some("0xtx_c".into()),
+            Some(1700000002), // watermark timestamp
+            &dd,
+        );
+        // Both should be found: tx_d (newer) and tx_b_late (same timestamp, not seen)
+        assert_eq!(new.len(), 2);
     }
 
     #[test]

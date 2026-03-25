@@ -23,6 +23,7 @@ use crate::report::analytics::{self, LivePortfolioState};
 use crate::report::html;
 use crate::sim::fill::{self, FillRequest};
 use crate::sim::portfolio::Portfolio;
+use crate::sim::tui::{self, RenderSnapshot};
 use crate::storage::db::Store;
 
 /// Session state managed by the engine.
@@ -51,6 +52,24 @@ pub struct EngineState {
     pub trade_time_books: TradeTimeBooks,
     /// Count of fills that used a trade-time snapshot instead of the live book.
     pub trade_time_hits: u64,
+    /// Per-wallet PnL history (wallet -> last few unrealized snapshots) for trend display.
+    pub wallet_pnl_history: HashMap<WalletAddr, Vec<Decimal>>,
+    /// Time-series PnL snapshots for the report chart. Recorded every 30s.
+    pub pnl_timeline: Vec<PnlSnapshot>,
+}
+
+/// A point-in-time snapshot of portfolio PnL for time series display.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PnlSnapshot {
+    pub elapsed_secs: u64,
+    pub net_pnl: Decimal,
+    pub realized_net: Decimal,
+    pub unrealized: Decimal,
+    pub positions: usize,
+    pub fills: u64,
+    pub misses: u64,
+    /// Per-wallet unrealized at this point.
+    pub wallet_unrealized: HashMap<WalletAddr, Decimal>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -61,6 +80,9 @@ pub struct CategoryStats {
     pub misses: u64,
     pub total_detection_delay_ms: u64,
     pub detection_delay_count: u64,
+    /// Realized PnL attributed to this category (from closed positions).
+    pub realized_pnl_gross: Decimal,
+    pub realized_fees: Decimal,
 }
 
 impl CategoryStats {
@@ -69,6 +91,70 @@ impl CategoryStats {
             Some(self.total_detection_delay_ms as f64 / self.detection_delay_count as f64)
         } else {
             None
+        }
+    }
+}
+
+impl EngineState {
+    fn render_snapshot(&self) -> RenderSnapshot {
+        let p = &self.portfolio;
+        let mode = self.config.session.marking_mode;
+        let unrealized = p.unrealized_pnl(&self.books, mode);
+        let realized_net = p.realized_pnl_net();
+        let total_attempts = p.fill_count + p.partial_fill_count + p.miss_count;
+        let fill_rate = if total_attempts > 0 {
+            ((p.fill_count + p.partial_fill_count) as f64 / total_attempts as f64) * 100.0
+        } else { 0.0 };
+
+        let dir = self.category_stats.get(&WalletCategory::Directional);
+        let arb = self.category_stats.get(&WalletCategory::Arbitrage);
+
+        // Per-category unrealized: sum unrealized PnL for positions by source_category
+        let mut dir_unrealized = Decimal::ZERO;
+        let mut arb_unrealized = Decimal::ZERO;
+        for (token_id, pos) in &p.positions {
+            let mark_price = match self.books.get(token_id) {
+                Some(book) => match mode {
+                    MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
+                    MarkingMode::Midpoint => book.midpoint().unwrap_or(Decimal::ZERO),
+                    MarkingMode::LastTrade => book.last_trade_price.unwrap_or(Decimal::ZERO),
+                },
+                None => Decimal::ZERO,
+            };
+            let pos_unrealized = pos.qty * mark_price - pos.cost_basis;
+            match pos.source_category {
+                WalletCategory::Directional => dir_unrealized += pos_unrealized,
+                WalletCategory::Arbitrage => arb_unrealized += pos_unrealized,
+            }
+        }
+
+        let dir_realized = dir.map(|s| s.realized_pnl_gross - s.realized_fees).unwrap_or(Decimal::ZERO);
+        let arb_realized = arb.map(|s| s.realized_pnl_gross - s.realized_fees).unwrap_or(Decimal::ZERO);
+
+        let account_value = p.account_value(&self.books, mode);
+
+        RenderSnapshot {
+            elapsed: format_elapsed(self.started_at.elapsed()),
+            net_pnl: realized_net + unrealized,
+            realized_net,
+            unrealized,
+            fees: p.realized_fees,
+            cash: p.cash,
+            account_value,
+            fill_rate,
+            positions: p.positions.len(),
+            books: self.books.len(),
+            dir_fills: dir.map(|s| s.fills + s.partials).unwrap_or(0),
+            dir_misses: dir.map(|s| s.misses).unwrap_or(0),
+            dir_lag: dir.and_then(|s| s.avg_detection_ms()),
+            dir_realized_net: dir_realized,
+            dir_unrealized,
+            arb_fills: arb.map(|s| s.fills + s.partials).unwrap_or(0),
+            arb_misses: arb.map(|s| s.misses).unwrap_or(0),
+            arb_lag: arb.and_then(|s| s.avg_detection_ms()),
+            arb_realized_net: arb_realized,
+            arb_unrealized,
+            trades_seen: self.wallet_trades_seen,
         }
     }
 }
@@ -165,6 +251,8 @@ pub async fn run_session(
         // typical Polymarket trade frequency without excessive memory.
         trade_time_books: TradeTimeBooks::new(10_000, 120),
         trade_time_hits: 0,
+        wallet_pnl_history: HashMap::new(),
+        pnl_timeline: Vec::new(),
     };
 
     // Shutdown signal
@@ -261,11 +349,14 @@ pub async fn run_session(
     let mut stale_timer = tokio::time::interval(Duration::from_secs(10));
     stale_timer.tick().await;
 
-    let mut status_timer = tokio::time::interval(Duration::from_secs(30));
-    status_timer.tick().await;
+    // Header refreshes every 5s (redraws in place), full status every 30s
+    let mut header_timer = tokio::time::interval(Duration::from_secs(5));
+    header_timer.tick().await;
 
     let mut leaderboard_timer = tokio::time::interval(Duration::from_secs(300));
     leaderboard_timer.tick().await;
+
+    let mut header_printed = false;
 
     let mut metadata_timer = tokio::time::interval(Duration::from_secs(config.ingestion.metadata_refresh_secs));
     metadata_timer.tick().await;
@@ -333,14 +424,34 @@ pub async fn run_session(
                 }
             }
 
-            // Periodic status
-            _ = status_timer.tick() => {
-                print_status(&state);
+            // Periodic header refresh (redraws stats in place) + record PnL timeline
+            _ = header_timer.tick() => {
+                let snap = state.render_snapshot();
+                if !header_printed {
+                    tui::print_header(&snap);
+                    header_printed = true;
+                } else {
+                    tui::update_header(&snap);
+                }
+
+                // Record PnL snapshot for time series (every tick = 5s)
+                let mode = state.config.session.marking_mode;
+                let wallet_unrealized = state.portfolio.unrealized_by_wallet(&state.books, mode);
+                state.pnl_timeline.push(PnlSnapshot {
+                    elapsed_secs: state.started_at.elapsed().as_secs(),
+                    net_pnl: snap.net_pnl,
+                    realized_net: snap.realized_net,
+                    unrealized: snap.unrealized,
+                    positions: snap.positions,
+                    fills: state.portfolio.fill_count + state.portfolio.partial_fill_count,
+                    misses: state.portfolio.miss_count,
+                    wallet_unrealized,
+                });
             }
 
             // Periodic wallet leaderboard (every 5 min)
             _ = leaderboard_timer.tick() => {
-                print_wallet_leaderboard(&state);
+                print_wallet_leaderboard(&mut state);
             }
 
             // Metadata refresh (runs on main task since Store isn't Send)
@@ -422,17 +533,22 @@ fn handle_ws_event(state: &mut EngineState, store: &Store, event: WsMarketEvent)
             }
         }
         WsMarketEvent::Disconnected { reason } => {
-            warn!(reason, "WebSocket disconnected — marking all books as rebuilding");
-            for book in state.books.values_mut() {
-                book.mark_rebuilding();
-            }
-            let event = NormalizedEvent::HealthEvent {
-                kind: "ws_disconnected".into(),
-                message: format!("WebSocket disconnected: {reason}"),
-                ts: Utc::now(),
-            };
-            if let Ok(id) = store.append_event(&state.session_id, &event) {
-                state.last_event_id = id;
+            // Only mark books as rebuilding once per disconnect (not on every reconnect attempt).
+            // Check if books are already in rebuilding state to avoid log spam.
+            let already_rebuilding = state.books.values().all(|b| b.quality == DataQuality::Rebuilding);
+            if !already_rebuilding {
+                debug!(reason, "WebSocket disconnected — marking books as rebuilding");
+                for book in state.books.values_mut() {
+                    book.mark_rebuilding();
+                }
+                let event = NormalizedEvent::HealthEvent {
+                    kind: "ws_disconnected".into(),
+                    message: format!("WebSocket disconnected: {reason}"),
+                    ts: Utc::now(),
+                };
+                if let Ok(id) = store.append_event(&state.session_id, &event) {
+                    state.last_event_id = id;
+                }
             }
         }
     }
@@ -700,6 +816,10 @@ async fn handle_wallet_trade(
         }
     }
 
+    // Snapshot PnL before applying, so we can compute the delta for category tracking
+    let pnl_before = state.portfolio.realized_pnl_gross;
+    let fees_before = state.portfolio.realized_fees;
+
     // Apply to portfolio
     match &output.result {
         FillResult::Full => {
@@ -748,8 +868,15 @@ async fn handle_wallet_trade(
         }
     }
 
+    // Track realized PnL/fees delta per category
+    let pnl_delta = state.portfolio.realized_pnl_gross - pnl_before;
+    let fees_delta = state.portfolio.realized_fees - fees_before;
+    // Re-borrow cat_stats (was dropped by match above)
+    let cat_stats = state.category_stats.entry(trade.category).or_default();
+    cat_stats.realized_pnl_gross += pnl_delta;
+    cat_stats.realized_fees += fees_delta;
+
     // === LIVE TRADE FEED ===
-    // Print a compact line for every detected trade so the operator can see activity
     let wallet_name = state.wallet_names.get(&trade.wallet)
         .cloned()
         .unwrap_or_else(|| abbreviate_addr(&trade.wallet));
@@ -763,42 +890,17 @@ async fn handle_wallet_trade(
             else { trade.token_id.clone() }
         });
 
-    let side_str = match trade.side {
-        Side::Buy => format!("{GREEN}BUY{RESET}"),
-        Side::Sell => format!("{RED}SELL{RESET}"),
-    };
-
-    let (result_str, cost_str) = match &output.result {
-        FillResult::Full => {
-            let price = output.avg_price.unwrap_or(Decimal::ZERO);
-            (
-                format!("{GREEN}FILL{RESET}"),
-                format!("{}@${:.3} fee=${:.4}", output.filled_qty, price, output.fee_amount),
-            )
-        }
-        FillResult::Partial { filled_qty } => {
-            let price = output.avg_price.unwrap_or(Decimal::ZERO);
-            (
-                format!("{YELLOW}PARTIAL{RESET}"),
-                format!("{filled_qty}@${:.3}", price),
-            )
-        }
-        FillResult::Miss { reason } => {
-            (
-                format!("{RED}MISS{RESET}"),
-                format!("{DIM}{reason:?}{RESET}"),
-            )
-        }
-    };
-
-    let lag_str = detection_delay_ms
-        .map(|d| if d >= 1000 { format!("{DIM}{:.0}s{RESET}", d as f64 / 1000.0) }
-             else { format!("{DIM}{}ms{RESET}", d) })
-        .unwrap_or_default();
-
-    println!(
-        "    {result_str} {side_str} {wallet_name:<10} {cost_str}  {market_name}  {lag_str}"
+    let line = tui::format_trade_line(
+        &output.result,
+        trade.side,
+        &wallet_name,
+        &market_name,
+        output.avg_price,
+        output.filled_qty,
+        output.fee_amount,
+        detection_delay_ms,
     );
+    println!("{line}");
 
     // Log the simulated fill event
     let fill_event = NormalizedEvent::SimulatedFill {
@@ -1037,8 +1139,8 @@ fn print_final_summary(state: &EngineState) {
     println!();
 }
 
-/// Print top/bottom wallets by unrealized PnL. Shown every 5 minutes.
-fn print_wallet_leaderboard(state: &EngineState) {
+/// Print top/bottom wallets by unrealized PnL with trend. Shown every 5 minutes.
+fn print_wallet_leaderboard(state: &mut EngineState) {
     let mode = state.config.session.marking_mode;
     let unrealized_map = state.portfolio.unrealized_by_wallet(&state.books, mode);
     let exposure_map = state.portfolio.exposure_by_wallet(&state.books, mode);
@@ -1047,30 +1149,52 @@ fn print_wallet_leaderboard(state: &EngineState) {
         return;
     }
 
+    // Record current snapshot in history and compute trend
+    for (wallet, pnl) in &unrealized_map {
+        let history = state.wallet_pnl_history.entry(wallet.clone()).or_default();
+        history.push(*pnl);
+        // Keep last 12 snapshots (= 1 hour at 5-min intervals)
+        if history.len() > 12 {
+            history.remove(0);
+        }
+    }
+
     let mut sorted: Vec<_> = unrealized_map.iter().collect();
     sorted.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let show = sorted.len().min(5);
+    let show = sorted.len().min(6);
 
     println!();
-    println!("  {DIM}┌─{RESET} {BOLD}Wallet Snapshot{RESET} {DIM}(open positions, unrealized PnL){RESET}");
+    println!("  {DIM}┌─{RESET} {BOLD}Wallet Snapshot{RESET} {DIM}(unrealized PnL, trend, exposure){RESET}");
 
     for (wallet, pnl) in &sorted[..show] {
         let name = state.wallet_names.get(*wallet)
             .cloned()
             .unwrap_or_else(|| abbreviate_addr(wallet));
         let exp = exposure_map.get(*wallet).copied().unwrap_or(Decimal::ZERO);
-        println!("  {DIM}│{RESET}  {:<12} {:>14}  {DIM}exp=${:.0}{RESET}", name, color_pnl(**pnl), exp);
+
+        // Trend: compare to previous snapshot
+        let trend = state.wallet_pnl_history.get(*wallet)
+            .and_then(|h| if h.len() >= 2 {
+                let prev = h[h.len() - 2];
+                let curr = h[h.len() - 1];
+                if curr > prev { Some(format!("{GREEN}{RESET}")) }
+                else if curr < prev { Some(format!("{RED}{RESET}")) }
+                else { Some(format!("{DIM}={RESET}")) }
+            } else { None })
+            .unwrap_or_default();
+
+        println!("  {DIM}│{RESET}  {:<12} {:>14} {trend}  {DIM}exp=${:.0}{RESET}", name, color_pnl(**pnl), exp);
     }
 
-    if sorted.len() > 5 {
+    if sorted.len() > show {
         let (worst_addr, worst_pnl) = sorted.last().unwrap();
         let worst_name = state.wallet_names.get(*worst_addr)
             .cloned()
             .unwrap_or_else(|| abbreviate_addr(worst_addr));
         let worst_exp = exposure_map.get(*worst_addr).copied().unwrap_or(Decimal::ZERO);
-        println!("  {DIM}│  ...  ({} more wallets){RESET}", sorted.len() - 5);
-        println!("  {DIM}│{RESET}  {:<12} {:>14}  {DIM}exp=${:.0}{RESET}", worst_name, color_pnl(**worst_pnl), worst_exp);
+        println!("  {DIM}│  ...  ({} more wallets){RESET}", sorted.len() - show);
+        println!("  {DIM}│{RESET}  {:<12} {:>14}    {DIM}exp=${:.0}{RESET}", worst_name, color_pnl(**worst_pnl), worst_exp);
     }
 
     println!("  {DIM}└─{RESET}");
@@ -1104,6 +1228,7 @@ fn generate_session_report(state: &EngineState, store: &Store, wallets: &[Tracke
         &wallet_names,
         &wallet_profiles,
         Some(&live),
+        state.pnl_timeline.clone(),
     ) {
         Ok(a) => a,
         Err(e) => {

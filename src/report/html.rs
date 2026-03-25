@@ -320,6 +320,118 @@ Realized PnL is negative ({realized}). The positive net figure includes unrealiz
         let _ = write!(html, "</table>");
     }
 
+    // === PnL EVOLUTION CHART (SVG) ===
+    if a.pnl_timeline.len() >= 2 {
+        let width = 800;
+        let height = 200;
+        let padding = 40;
+
+        let min_pnl = a.pnl_timeline.iter()
+            .map(|p| p.net_pnl.min(p.realized_net))
+            .min().unwrap_or(Decimal::ZERO);
+        let max_pnl = a.pnl_timeline.iter()
+            .map(|p| p.net_pnl.max(p.realized_net))
+            .max().unwrap_or(Decimal::ONE);
+        let max_secs = a.pnl_timeline.last().map(|p| p.elapsed_secs).unwrap_or(1).max(1);
+
+        let range = (max_pnl - min_pnl).max(Decimal::ONE);
+        let scale_x = |secs: u64| -> f64 {
+            padding as f64 + (secs as f64 / max_secs as f64) * (width - 2 * padding) as f64
+        };
+        let scale_y = |v: Decimal| -> f64 {
+            let frac = ((v - min_pnl) / range).to_string().parse::<f64>().unwrap_or(0.0);
+            (height - padding) as f64 - frac * (height - 2 * padding) as f64
+        };
+
+        // Build SVG path for net PnL
+        let mut net_path = String::new();
+        let mut real_path = String::new();
+        for (i, snap) in a.pnl_timeline.iter().enumerate() {
+            let x = scale_x(snap.elapsed_secs);
+            let cmd = if i == 0 { "M" } else { "L" };
+            let _ = write!(net_path, "{cmd}{x:.1},{:.1} ", scale_y(snap.net_pnl));
+            let _ = write!(real_path, "{cmd}{x:.1},{:.1} ", scale_y(snap.realized_net));
+        }
+
+        // Zero line
+        let zero_y = scale_y(Decimal::ZERO);
+
+        let _ = write!(html,
+            r#"<h2>PnL Evolution</h2>
+<svg viewBox="0 0 {width} {height}" style="width:100%;max-width:{width}px;background:var(--card);border-radius:6px;border:1px solid var(--border);margin-bottom:24px">
+  <line x1="{padding}" y1="{zero_y:.0}" x2="{end_x}" y2="{zero_y:.0}" stroke="var(--border)" stroke-dasharray="4"/>
+  <path d="{net_path}" fill="none" stroke="var(--blue)" stroke-width="2"/>
+  <path d="{real_path}" fill="none" stroke="var(--green)" stroke-width="1.5" stroke-dasharray="4"/>
+  <text x="{legend_x}" y="20" fill="var(--blue)" font-size="11">net pnl</text>
+  <text x="{legend_x2}" y="20" fill="var(--green)" font-size="11">realized</text>
+  <text x="{padding}" y="{bottom}" fill="var(--muted)" font-size="10">0s</text>
+  <text x="{end_x}" y="{bottom}" fill="var(--muted)" font-size="10" text-anchor="end">{duration}</text>
+</svg>
+"#,
+            zero_y = zero_y,
+            end_x = width - padding,
+            net_path = net_path,
+            real_path = real_path,
+            legend_x = width - padding - 120,
+            legend_x2 = width - padding - 50,
+            bottom = height - 5,
+            duration = {
+                let s = max_secs;
+                if s >= 3600 { format!("{}h{:02}m", s / 3600, (s % 3600) / 60) }
+                else { format!("{}m", s / 60) }
+            },
+        );
+    }
+
+    // === OPEN POSITIONS ===
+    if !a.open_positions.is_empty() {
+        let total_value: Decimal = a.open_positions.iter().map(|p| p.market_value).sum();
+        let total_unrealized: Decimal = a.open_positions.iter().map(|p| p.unrealized_pnl).sum();
+        let show = a.open_positions.len().min(50);
+
+        let _ = write!(html,
+            r#"<h2>Open Positions ({count}, value ${total_value:.2}, unrealized {total_unreal})</h2>
+<table>
+<tr><th>Market</th><th>Outcome</th><th>Wallet</th><th class="right">Qty</th><th class="right">Entry</th><th class="right">Mark</th><th class="right">Value</th><th class="right">Unrealized</th></tr>"#,
+            count = a.open_positions.len(),
+            total_value = total_value,
+            total_unreal = fmt_pnl(total_unrealized),
+        );
+
+        for pos in &a.open_positions[..show] {
+            let market = pos.market_question.as_deref().unwrap_or("Unknown market");
+            let market_short = if market.len() > 50 { format!("{}...", &market[..47]) } else { market.to_string() };
+            let outcome = pos.outcome_label.as_deref().unwrap_or("—");
+            let _ = write!(html,
+                r#"<tr>
+<td title="{token}">{market}</td>
+<td>{outcome}</td>
+<td>{wallet}</td>
+<td class="right">{qty:.1}</td>
+<td class="right">${entry:.4}</td>
+<td class="right">${mark:.4}</td>
+<td class="right">${value:.2}</td>
+<td class="right {uc}">{unreal}</td>
+</tr>"#,
+                token = pos.token_id,
+                market = html_escape(&market_short),
+                outcome = outcome,
+                wallet = html_escape(&pos.source_wallet_name),
+                qty = pos.qty,
+                entry = pos.avg_entry,
+                mark = pos.mark_price,
+                value = pos.market_value,
+                uc = pnl_class(pos.unrealized_pnl),
+                unreal = fmt_pnl(pos.unrealized_pnl),
+            );
+        }
+        if a.open_positions.len() > show {
+            let _ = write!(html, r#"<tr><td colspan="8" style="text-align:center;color:var(--muted)">... {} more positions</td></tr>"#,
+                a.open_positions.len() - show);
+        }
+        let _ = write!(html, "</table>");
+    }
+
     // === MISS REASONS ===
     if !a.miss_reasons.is_empty() {
         let _ = write!(
@@ -552,6 +664,8 @@ mod tests {
             trades: vec![],
             first_event_ts: None,
             last_event_ts: None,
+            open_positions: vec![],
+            pnl_timeline: vec![],
         }
     }
 

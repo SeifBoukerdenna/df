@@ -4,11 +4,9 @@
 //! at the top while trades scroll below it. The header redraws in place
 //! every 5 seconds without cluttering the trade feed.
 
-use std::collections::HashMap;
 use std::io::{self, Write};
-use std::sync::Mutex;
 
-use crossterm::{cursor, execute, terminal, style};
+use crossterm::{cursor, execute, terminal};
 use rust_decimal::Decimal;
 
 use crate::core::types::*;
@@ -49,15 +47,21 @@ pub struct RenderSnapshot {
     pub realized_net: Decimal,
     pub unrealized: Decimal,
     pub fees: Decimal,
+    pub cash: Decimal,
+    pub account_value: Decimal,
     pub fill_rate: f64,
     pub positions: usize,
     pub books: usize,
     pub dir_fills: u64,
     pub dir_misses: u64,
     pub dir_lag: Option<f64>,
+    pub dir_realized_net: Decimal,
+    pub dir_unrealized: Decimal,
     pub arb_fills: u64,
     pub arb_misses: u64,
     pub arb_lag: Option<f64>,
+    pub arb_realized_net: Decimal,
+    pub arb_unrealized: Decimal,
     pub trades_seen: u64,
 }
 
@@ -124,26 +128,30 @@ fn render_header_block(out: &mut impl Write, s: &RenderSnapshot) {
     println!("  {DIM}realized={RESET}{}  {DIM}unrealized={RESET}{}  {DIM}fees={RESET}{RED}${:.2}{RESET}                          ",
         color_pnl(s.realized_net), color_pnl(s.unrealized), s.fees);
 
-    // Line 3: Fill stats
+    // Line 3: Portfolio + fill stats
     let fill_color = if s.fill_rate >= 50.0 { GREEN } else if s.fill_rate >= 25.0 { YELLOW } else { RED };
     let _ = execute!(out, terminal::Clear(terminal::ClearType::CurrentLine));
-    println!("  {DIM}fill rate={RESET}{fill_color}{BOLD}{:.0}%{RESET}  {DIM}positions={RESET}{BOLD}{}{RESET}  {DIM}books={RESET}{}  {DIM}trades={RESET}{}                       ",
-        s.fill_rate, s.positions, s.books, s.trades_seen);
+    println!("  {DIM}account={RESET}{BOLD}${:.0}{RESET}  {DIM}cash={RESET}${:.0}  {DIM}fill={RESET}{fill_color}{BOLD}{:.0}%{RESET}  {DIM}pos={RESET}{BOLD}{}{RESET}  {DIM}books={RESET}{}  {DIM}trades={RESET}{}                  ",
+        s.account_value, s.cash, s.fill_rate, s.positions, s.books, s.trades_seen);
 
     // Line 4: blank separator
     let _ = execute!(out, terminal::Clear(terminal::ClearType::CurrentLine));
     println!();
 
-    // Line 5: Directional
+    // Line 5: Directional with PnL
     let dir_lag = s.dir_lag.map(|v| format!(" {DIM}lag={:.0}s{RESET}", v / 1000.0)).unwrap_or_default();
+    let dir_total_pnl = s.dir_realized_net + s.dir_unrealized;
     let _ = execute!(out, terminal::Clear(terminal::ClearType::CurrentLine));
-    println!("  {CYAN}{BOLD}directional{RESET}  {GREEN}{}{RESET} fills  {RED}{}{RESET} misses{dir_lag}                                       ",
+    println!("  {CYAN}{BOLD}directional{RESET}  {}  {DIM}(real={} unreal={}){RESET}  {GREEN}{}{RESET}f/{RED}{}{RESET}m{dir_lag}                     ",
+        color_pnl(dir_total_pnl), color_pnl(s.dir_realized_net), color_pnl(s.dir_unrealized),
         s.dir_fills, s.dir_misses);
 
-    // Line 6: Arbitrage
+    // Line 6: Arbitrage with PnL
     let arb_lag = s.arb_lag.map(|v| format!(" {DIM}lag={:.0}s{RESET}", v / 1000.0)).unwrap_or_default();
+    let arb_total_pnl = s.arb_realized_net + s.arb_unrealized;
     let _ = execute!(out, terminal::Clear(terminal::ClearType::CurrentLine));
-    println!("  {YELLOW}{BOLD}arbitrage{RESET}    {GREEN}{}{RESET} fills  {RED}{}{RESET} misses{arb_lag}                                       ",
+    println!("  {YELLOW}{BOLD}arbitrage{RESET}    {}  {DIM}(real={} unreal={}){RESET}  {GREEN}{}{RESET}f/{RED}{}{RESET}m{arb_lag}                     ",
+        color_pnl(arb_total_pnl), color_pnl(s.arb_realized_net), color_pnl(s.arb_unrealized),
         s.arb_fills, s.arb_misses);
 
     // Line 7: blank

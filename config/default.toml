@@ -61,7 +61,10 @@ mark_interval_secs = 5
 # Directional wallets — conviction bets, slower signal decay.
 # Wider tolerances are appropriate since the edge persists longer.
 [category.directional]
-max_slippage_bps = "500"
+# Directional = follow the trade, period. 2000 bps (20%) tolerance.
+# The whole point is to answer "would copying this wallet work?"
+# Rejecting trades on slippage defeats the experiment.
+max_slippage_bps = "5000"
 # No detection age limit — directional signals stay relevant longer.
 
 # Arbitrage wallets — fast-decaying edge, structurally disadvantaged by REST polling.

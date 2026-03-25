@@ -66,6 +66,29 @@ pub struct SessionAnalytics {
     // Session time range
     pub first_event_ts: Option<DateTime<Utc>>,
     pub last_event_ts: Option<DateTime<Utc>>,
+
+    // Open positions at end of session
+    pub open_positions: Vec<OpenPositionStats>,
+
+    // PnL time series for chart
+    pub pnl_timeline: Vec<crate::sim::engine::PnlSnapshot>,
+}
+
+/// An open position at end of session for display in the report.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenPositionStats {
+    pub token_id: TokenId,
+    pub market_question: Option<String>,
+    pub outcome_label: Option<String>,
+    pub qty: Decimal,
+    pub cost_basis: Decimal,
+    pub avg_entry: Decimal,
+    pub mark_price: Decimal,
+    pub market_value: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub source_wallet: WalletAddr,
+    pub source_wallet_name: String,
+    pub source_category: WalletCategory,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +172,7 @@ pub fn compute_analytics(
     wallet_names: &HashMap<String, String>,
     wallet_profiles: &HashMap<String, Option<String>>,
     live_state: Option<&LivePortfolioState<'_>>,
+    pnl_timeline: Vec<crate::sim::engine::PnlSnapshot>,
 ) -> Result<SessionAnalytics, Box<dyn std::error::Error>> {
     let events = store.load_events_after(session_id, 0)?;
     let token_names = store.build_token_name_map();
@@ -519,15 +543,56 @@ pub fn compute_analytics(
         })
         .collect();
 
-    // Compute unrealized PnL from live state if available
+    // Compute unrealized PnL and build open positions from live state
     let realized_net = realized_pnl_gross - realized_fees;
-    let (unrealized, unrealized_after_fees, net_pnl) = match live_state {
+    let (unrealized, unrealized_after_fees, net_pnl, open_positions) = match live_state {
         Some(ls) => {
             let raw = ls.portfolio.unrealized_pnl(ls.books, ls.marking_mode);
             let after_fees = ls.portfolio.unrealized_pnl_after_fees(ls.books, ls.marking_mode, Some(ls.store));
-            (Some(raw), Some(after_fees), Some(realized_net + after_fees))
+
+            // Build open positions list
+            let mut positions = Vec::new();
+            for (tid, pos) in &ls.portfolio.positions {
+                let mark_price = match ls.books.get(tid) {
+                    Some(book) => match ls.marking_mode {
+                        MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
+                        MarkingMode::Midpoint => book.midpoint().unwrap_or(Decimal::ZERO),
+                        MarkingMode::LastTrade => book.last_trade_price.unwrap_or(Decimal::ZERO),
+                    },
+                    None => Decimal::ZERO,
+                };
+                let market_value = pos.qty * mark_price;
+                let (mq, ol) = token_names
+                    .get(tid)
+                    .map(|(q, o)| (Some(q.clone()), Some(o.clone())))
+                    .unwrap_or((None, None));
+                let wallet_display = wallet_names
+                    .get(&pos.source_wallet)
+                    .cloned()
+                    .unwrap_or_else(|| abbreviate_address(&pos.source_wallet));
+
+                positions.push(OpenPositionStats {
+                    token_id: tid.clone(),
+                    market_question: mq,
+                    outcome_label: ol,
+                    qty: pos.qty,
+                    cost_basis: pos.cost_basis,
+                    avg_entry: pos.avg_entry_price,
+                    mark_price,
+                    market_value,
+                    unrealized_pnl: market_value - pos.cost_basis,
+                    source_wallet: pos.source_wallet.clone(),
+                    source_wallet_name: wallet_display,
+                    source_category: pos.source_category,
+                });
+            }
+            // Sort by absolute unrealized PnL descending (biggest movers first)
+            positions.sort_by(|a, b| b.unrealized_pnl.abs().partial_cmp(&a.unrealized_pnl.abs())
+                .unwrap_or(std::cmp::Ordering::Equal));
+
+            (Some(raw), Some(after_fees), Some(realized_net + after_fees), positions)
         }
-        None => (None, None, None),
+        None => (None, None, None, Vec::new()),
     };
 
     Ok(SessionAnalytics {
@@ -560,6 +625,8 @@ pub fn compute_analytics(
         trades,
         first_event_ts: first_ts,
         last_event_ts: last_ts,
+        open_positions,
+        pnl_timeline,
     })
 }
 
@@ -624,7 +691,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let names = HashMap::new();
         let profiles = HashMap::new();
-        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None).unwrap();
+        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None, Vec::new()).unwrap();
         assert_eq!(a.total_events, 0);
         assert_eq!(a.total_wallet_trades, 0);
         assert_eq!(a.fill_rate_pct, dec!(0));
@@ -672,7 +739,7 @@ mod tests {
         };
         store.append_event("s1", &fill).unwrap();
 
-        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None).unwrap();
+        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None, Vec::new()).unwrap();
         assert_eq!(a.total_wallet_trades, 1);
         assert_eq!(a.total_fills, 1);
         assert_eq!(a.total_misses, 0);
@@ -727,7 +794,7 @@ mod tests {
         };
         store.append_event("s1", &miss).unwrap();
 
-        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None).unwrap();
+        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, None, Vec::new()).unwrap();
         assert_eq!(a.total_misses, 1);
         assert_eq!(a.miss_reasons.get("DetectionTooOld"), Some(&1));
         // Must NOT be classified as StaleBook
@@ -817,7 +884,7 @@ mod tests {
             store: &store,
         };
 
-        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, Some(&live)).unwrap();
+        let a = compute_analytics(&store, "s1", dec!(10000), &names, &profiles, Some(&live), Vec::new()).unwrap();
 
         // Unrealized should be present
         assert!(a.unrealized_pnl.is_some());
