@@ -22,7 +22,7 @@ use crate::ingestion::ws_market::{self, WsMarketEvent};
 use crate::report::analytics::{self, LivePortfolioState};
 use crate::report::html;
 use crate::sim::fill::{self, FillRequest};
-use crate::sim::portfolio::Portfolio;
+use crate::sim::portfolio::{Portfolio, PositionKey};
 use crate::sim::tui::{self, RenderSnapshot};
 use crate::storage::db::Store;
 
@@ -112,7 +112,8 @@ impl EngineState {
         // Per-category unrealized: sum unrealized PnL for positions by source_category
         let mut dir_unrealized = Decimal::ZERO;
         let mut arb_unrealized = Decimal::ZERO;
-        for (token_id, pos) in &p.positions {
+        for (_key, pos) in &p.positions {
+            let token_id = &pos.token_id;
             let mark_price = match self.books.get(token_id) {
                 Some(book) => match mode {
                     MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
@@ -459,6 +460,9 @@ pub async fn run_session(
                 if let Err(e) = rest_metadata::refresh_markets(&metadata_client, &store).await {
                     debug!(error = %e, "metadata refresh failed");
                 }
+
+                // Check for resolved markets and settle positions
+                check_market_resolutions(&mut state, &store);
             }
 
             // Background fee refresh for tracked tokens
@@ -748,7 +752,7 @@ async fn handle_wallet_trade(
     }
 
     // Get current position qty for sell validation
-    let current_qty = state.portfolio.position_qty(&trade.token_id);
+    let current_qty = state.portfolio.position_qty(&trade.token_id, &trade.wallet);
 
     // Category-specific position sizing
     let max_fraction = state.config.max_position_fraction_for(trade.category);
@@ -831,7 +835,7 @@ async fn handle_wallet_trade(
                     &trade.wallet,
                     trade.category,
                 ),
-                Side::Sell => state.portfolio.apply_sell(&trade.token_id, &output),
+                Side::Sell => state.portfolio.apply_sell(&trade.token_id, &trade.wallet, &output),
             };
             if let Err(e) = apply_result {
                 error!(error = %e, "portfolio error on full fill");
@@ -851,7 +855,7 @@ async fn handle_wallet_trade(
                     &trade.wallet,
                     trade.category,
                 ),
-                Side::Sell => state.portfolio.apply_sell(&trade.token_id, &output),
+                Side::Sell => state.portfolio.apply_sell(&trade.token_id, &trade.wallet, &output),
             };
             if let Err(e) = apply_result {
                 error!(error = %e, "portfolio error on partial fill");
@@ -970,11 +974,13 @@ fn format_elapsed(d: std::time::Duration) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn fmt_pnl_short(v: Decimal) -> String {
     if v >= Decimal::ZERO { format!("+${v:.2}") } else { format!("-${:.2}", v.abs()) }
 }
 
-/// Compact, operator-friendly status line. One line per 30s, scannable.
+/// Legacy status line (kept for non-TUI fallback).
+#[allow(dead_code)]
 fn print_status(state: &EngineState) {
     let p = &state.portfolio;
     let mode = state.config.session.marking_mode;
@@ -1206,6 +1212,73 @@ fn abbreviate_addr(addr: &str) -> String {
         format!("{}…{}", &addr[..6], &addr[addr.len() - 4..])
     } else {
         addr.to_string()
+    }
+}
+
+/// Check for resolved markets and settle any open positions at 0 or 1.
+/// Markets that have closed/resolved are settled at their resolution price.
+fn check_market_resolutions(state: &mut EngineState, store: &Store) {
+    // Get token -> market mapping to check resolution status
+    let _token_map = store.build_token_name_map();
+
+    // Collect positions that need settlement (can't mutate while iterating)
+    let mut to_settle: Vec<(PositionKey, Decimal)> = Vec::new();
+
+    for (key, pos) in &state.portfolio.positions {
+        // Check if this token's market is resolved by looking at the markets table
+        // A resolved market will have active=0 in the DB after metadata refresh
+        if let Some(book) = state.books.get(&pos.token_id) {
+            // If the book has a last_trade_price of exactly 0 or 1, the market likely resolved
+            if let Some(ltp) = book.last_trade_price {
+                if ltp == Decimal::ZERO || ltp == Decimal::ONE {
+                    to_settle.push((key.clone(), ltp));
+                }
+            }
+        }
+    }
+
+    // Settle resolved positions
+    for (key, resolution_price) in to_settle {
+        if let Some(pos) = state.portfolio.positions.get(&key) {
+            let proceeds = pos.qty * resolution_price;
+            let cost_of_sold = pos.cost_basis;
+            let gross_pnl = proceeds - cost_of_sold;
+
+            state.portfolio.cash += proceeds;
+            state.portfolio.realized_pnl_gross += gross_pnl;
+            state.portfolio.turnover += proceeds;
+
+            let wallet = pos.source_wallet.clone();
+            let token = pos.token_id.clone();
+            let cat = pos.source_category;
+            let qty = pos.qty;
+
+            info!(
+                token = %token,
+                wallet = %wallet,
+                qty = %qty,
+                resolution_price = %resolution_price,
+                pnl = %gross_pnl,
+                "market resolved — position settled"
+            );
+
+            // Track in category stats
+            if let Some(cs) = state.category_stats.get_mut(&cat) {
+                cs.realized_pnl_gross += gross_pnl;
+            }
+
+            // Log settlement event
+            let event = NormalizedEvent::HealthEvent {
+                kind: "market_resolution".into(),
+                message: format!(
+                    "Settled position: {} qty={} @ {} pnl={}",
+                    token, qty, resolution_price, gross_pnl
+                ),
+                ts: Utc::now(),
+            };
+            let _ = store.append_event(&state.session_id, &event);
+        }
+        state.portfolio.positions.remove(&key);
     }
 }
 

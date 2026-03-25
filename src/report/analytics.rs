@@ -552,7 +552,8 @@ pub fn compute_analytics(
 
             // Build open positions list
             let mut positions = Vec::new();
-            for (tid, pos) in &ls.portfolio.positions {
+            for (_key, pos) in &ls.portfolio.positions {
+                let tid = &pos.token_id;
                 let mark_price = match ls.books.get(tid) {
                     Some(book) => match ls.marking_mode {
                         MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),

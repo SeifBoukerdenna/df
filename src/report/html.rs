@@ -383,6 +383,159 @@ Realized PnL is negative ({realized}). The positive net figure includes unrealiz
         );
     }
 
+    // === PER-WALLET EQUITY CURVES ===
+    if a.pnl_timeline.len() >= 3 {
+        // Collect all wallets that appear in the timeline
+        let mut all_wallets: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for snap in &a.pnl_timeline {
+            for w in snap.wallet_unrealized.keys() {
+                all_wallets.insert(w.clone());
+            }
+        }
+
+        if !all_wallets.is_empty() {
+            // Sort wallets: get final unrealized for ordering
+            let mut wallet_list: Vec<_> = all_wallets.into_iter().collect();
+            let last_snap = a.pnl_timeline.last();
+            wallet_list.sort_by(|wa, wb| {
+                let a_final = last_snap
+                    .and_then(|s| s.wallet_unrealized.get(wa.as_str()))
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                let b_final = last_snap
+                    .and_then(|s| s.wallet_unrealized.get(wb.as_str()))
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                b_final.partial_cmp(&a_final).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let _ = write!(html, r#"<h2>Per-Wallet PnL Evolution</h2><div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(350px, 1fr));gap:12px;margin-bottom:24px">"#);
+
+            let max_secs = a.pnl_timeline.last().map(|p| p.elapsed_secs).unwrap_or(1).max(1);
+
+            for wallet_addr in &wallet_list {
+                // Get display name
+                let display_name = a.wallet_stats.iter()
+                    .find(|w| &w.wallet == wallet_addr)
+                    .map(|w| w.display_name.clone())
+                    .unwrap_or_else(|| {
+                        if wallet_addr.len() > 10 {
+                            format!("{}…{}", &wallet_addr[..6], &wallet_addr[wallet_addr.len()-4..])
+                        } else { wallet_addr.clone() }
+                    });
+
+                // Collect data points for this wallet
+                let points: Vec<(u64, Decimal)> = a.pnl_timeline.iter()
+                    .filter_map(|snap| {
+                        snap.wallet_unrealized.get(wallet_addr).map(|v| (snap.elapsed_secs, *v))
+                    })
+                    .collect();
+
+                if points.len() < 2 { continue; }
+
+                let w = 350u32;
+                let h = 100u32;
+                let pad = 25u32;
+
+                let min_v = points.iter().map(|(_, v)| *v).min().unwrap_or(Decimal::ZERO);
+                let max_v = points.iter().map(|(_, v)| *v).max().unwrap_or(Decimal::ONE);
+                let range = (max_v - min_v).max(Decimal::ONE);
+
+                let scale_x = |secs: u64| -> f64 {
+                    pad as f64 + (secs as f64 / max_secs as f64) * (w - 2 * pad) as f64
+                };
+                let scale_y = |v: Decimal| -> f64 {
+                    let frac = ((v - min_v) / range).to_string().parse::<f64>().unwrap_or(0.0);
+                    (h - pad) as f64 - frac * (h - 2 * pad) as f64
+                };
+
+                let mut path = String::new();
+                for (i, (secs, val)) in points.iter().enumerate() {
+                    let cmd = if i == 0 { "M" } else { "L" };
+                    let _ = write!(path, "{cmd}{:.1},{:.1} ", scale_x(*secs), scale_y(*val));
+                }
+
+                let final_val = points.last().map(|(_, v)| *v).unwrap_or(Decimal::ZERO);
+                let line_color = if final_val >= Decimal::ZERO { "var(--green)" } else { "var(--red)" };
+                let zero_y = scale_y(Decimal::ZERO);
+
+                let _ = write!(html,
+                    r#"<div class="card" style="padding:10px">
+<div style="font-size:12px;margin-bottom:4px"><strong>{name}</strong> <span class="{fc}" style="font-size:14px;font-weight:600">{val}</span></div>
+<svg viewBox="0 0 {w} {h}" style="width:100%;height:{h}px">
+  <line x1="{pad}" y1="{zy:.0}" x2="{ex}" y2="{zy:.0}" stroke="var(--border)" stroke-dasharray="2" stroke-width="0.5"/>
+  <path d="{path}" fill="none" stroke="{lc}" stroke-width="1.5"/>
+</svg>
+</div>"#,
+                    name = html_escape(&display_name),
+                    fc = pnl_class(final_val),
+                    val = fmt_pnl(final_val),
+                    w = w, h = h, pad = pad,
+                    zy = zero_y,
+                    ex = w - pad,
+                    path = path,
+                    lc = line_color,
+                );
+            }
+            let _ = write!(html, "</div>");
+        }
+    }
+
+    // === SOURCE vs FOLLOWER COMPARISON ===
+    if !a.trades.is_empty() {
+        let filled_trades: Vec<_> = a.trades.iter()
+            .filter(|t| t.fill_result == "full" || t.fill_result == "partial")
+            .filter(|t| t.our_price.is_some())
+            .collect();
+
+        if !filled_trades.is_empty() {
+            // Compute aggregate price impact
+            let mut total_improvement = Decimal::ZERO;
+            let mut total_cost = Decimal::ZERO;
+            let mut better_count = 0usize;
+            let mut worse_count = 0usize;
+            let mut same_count = 0usize;
+
+            for t in &filled_trades {
+                let our = t.our_price.unwrap();
+                let diff = match t.side {
+                    crate::core::types::Side::Buy => t.wallet_price - our,   // positive = we paid less = good
+                    crate::core::types::Side::Sell => our - t.wallet_price,   // positive = we got more = good
+                };
+                let impact = diff * t.our_qty;
+                total_improvement += impact;
+                total_cost += t.our_qty * our;
+
+                if diff > Decimal::ZERO { better_count += 1; }
+                else if diff < Decimal::ZERO { worse_count += 1; }
+                else { same_count += 1; }
+            }
+
+            let _ = write!(html,
+                r#"<h2>Source Wallet vs Follower Execution</h2>
+<div class="grid">
+<div class="card">
+  <div class="label">Price Impact (all fills)</div>
+  <div class="value {ic}">{impact}</div>
+  <div class="sub">Positive = we executed better than source wallet</div>
+</div>
+<div class="card">
+  <div class="label">Better / Worse / Same</div>
+  <div class="value"><span class="win">{better}</span> / <span class="loss">{worse}</span> / {same}</div>
+  <div class="sub">of {total} filled trades</div>
+</div>
+</div>
+"#,
+                ic = pnl_class(total_improvement),
+                impact = fmt_pnl(total_improvement),
+                better = better_count,
+                worse = worse_count,
+                same = same_count,
+                total = filled_trades.len(),
+            );
+        }
+    }
+
     // === OPEN POSITIONS ===
     if !a.open_positions.is_empty() {
         let total_value: Decimal = a.open_positions.iter().map(|p| p.market_value).sum();
@@ -539,7 +692,7 @@ Realized PnL is negative ({realized}). The positive net figure includes unrealiz
             html,
             r#"<h2>Trade Log ({showing} of {total})</h2>
 <table>
-<tr><th>Time</th><th>Wallet</th><th>Side</th><th>Market</th><th class="right">Wallet Price</th><th class="right">Our Price</th><th class="right">Qty</th><th class="right">Fee</th><th>Slippage</th><th>Detection</th><th>Result</th></tr>"#,
+<tr><th>Time</th><th>Wallet</th><th>Side</th><th>Market</th><th class="right">Source $</th><th class="right">Our $</th><th class="right">Impact</th><th class="right">Qty</th><th class="right">Fee</th><th>Detection</th><th>Result</th></tr>"#,
             showing = show_count,
             total = a.trades.len(),
         );
@@ -569,9 +722,16 @@ Realized PnL is negative ({realized}). The positive net figure includes unrealiz
             let our_price_str = t.our_price
                 .map(|p| format!("${p:.4}"))
                 .unwrap_or_else(|| "—".into());
-            let slippage_str = t.slippage_bps
-                .map(|s| format!("{s}bps"))
-                .unwrap_or_else(|| "—".into());
+            // Price impact: positive = we got better than source, negative = worse
+            let impact_str = t.our_price.map(|our| {
+                let diff = match t.side {
+                    crate::core::types::Side::Buy => t.wallet_price - our,
+                    crate::core::types::Side::Sell => our - t.wallet_price,
+                };
+                let dollar_impact = diff * t.our_qty;
+                let ic = pnl_class(dollar_impact);
+                format!(r#"<span class="{ic}">{}</span>"#, fmt_pnl(dollar_impact))
+            }).unwrap_or_else(|| "—".into());
             let detection_str = t.detection_delay_ms
                 .map(|d| {
                     if d >= 1000 { format!("{:.1}s", d as f64 / 1000.0) }
@@ -588,9 +748,9 @@ Realized PnL is negative ({realized}). The positive net figure includes unrealiz
 <td title="{token_full}">{market_label}</td>
 <td class="right">${wprice:.4}</td>
 <td class="right">{our_price}</td>
+<td class="right">{impact}</td>
 <td class="right">{qty}</td>
 <td class="right">${fee:.4}</td>
-<td>{slippage}</td>
 <td>{detection}</td>
 <td><span class="tag {result_class}">{result}</span></td>
 </tr>"#,
@@ -603,9 +763,9 @@ Realized PnL is negative ({realized}). The positive net figure includes unrealiz
                 market_label = html_escape(&market_label),
                 wprice = t.wallet_price,
                 our_price = our_price_str,
+                impact = impact_str,
                 qty = t.our_qty,
                 fee = t.fee_amount,
-                slippage = slippage_str,
                 detection = detection_str,
                 result_class = result_class,
                 result = t.fill_result,

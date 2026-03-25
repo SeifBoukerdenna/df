@@ -148,7 +148,7 @@ pub fn replay_session(
                                 &wallet,
                                 category,
                             ),
-                            Side::Sell => portfolio.apply_sell(&token_id, &fill_output),
+                            Side::Sell => portfolio.apply_sell(&token_id, &wallet, &fill_output),
                         };
 
                         if let Err(e) = result {

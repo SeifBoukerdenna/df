@@ -8,6 +8,17 @@ use crate::core::book::OrderBook;
 use crate::core::types::{FeeSource, MarkingMode, TokenId, WalletAddr, WalletCategory};
 use crate::sim::fill::FillOutput;
 
+/// Composite key for positions: "token_id|wallet".
+/// This ensures two wallets buying the same token get separate positions
+/// with independent cost basis, PnL, and attribution.
+/// Using String instead of tuple for JSON serialization compatibility.
+pub type PositionKey = String;
+
+/// Create a position key from token_id and wallet address.
+pub fn make_position_key(token_id: &str, wallet: &str) -> PositionKey {
+    format!("{token_id}|{wallet}")
+}
+
 /// A single position in the session portfolio.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -25,7 +36,8 @@ pub struct Position {
 pub struct Portfolio {
     pub starting_capital: Decimal,
     pub cash: Decimal,
-    pub positions: HashMap<TokenId, Position>,
+    /// Positions keyed by (token_id, source_wallet) for per-wallet attribution.
+    pub positions: HashMap<PositionKey, Position>,
     pub realized_pnl_gross: Decimal,
     pub realized_fees: Decimal,
     pub turnover: Decimal,
@@ -79,9 +91,10 @@ impl Portfolio {
             self.degraded_fill_count += 1;
         }
 
+        let key = make_position_key(token_id, wallet);
         let position = self
             .positions
-            .entry(token_id.clone())
+            .entry(key)
             .or_insert_with(|| Position {
                 token_id: token_id.clone(),
                 market_id: market_id.to_string(),
@@ -108,15 +121,17 @@ impl Portfolio {
     pub fn apply_sell(
         &mut self,
         token_id: &TokenId,
+        wallet: &WalletAddr,
         fill: &FillOutput,
     ) -> Result<(), PortfolioError> {
         if fill.filled_qty == Decimal::ZERO {
             return Ok(());
         }
 
-        let Some(position) = self.positions.get_mut(token_id) else {
+        let key = make_position_key(token_id, wallet);
+        let Some(position) = self.positions.get_mut(&key) else {
             return Err(PortfolioError::InvariantViolation(
-                format!("sell on non-existent position {token_id}"),
+                format!("sell on non-existent position {token_id} for wallet {wallet}"),
             ));
         };
 
@@ -129,7 +144,7 @@ impl Portfolio {
             ));
         }
 
-        let proceeds = fill.cost; // For sells, cost = filled_qty * avg_price = what we receive
+        let proceeds = fill.cost;
         let cost_of_sold = position.avg_entry_price * fill.filled_qty;
         let gross_pnl = proceeds - cost_of_sold;
 
@@ -146,7 +161,7 @@ impl Portfolio {
         position.cost_basis -= cost_of_sold;
 
         if position.qty == Decimal::ZERO {
-            self.positions.remove(token_id);
+            self.positions.remove(&key);
         }
 
         self.check_invariants(None)?;
@@ -168,10 +183,11 @@ impl Portfolio {
         self.fill_count += 1;
     }
 
-    /// Get the position qty for a token (0 if no position).
-    pub fn position_qty(&self, token_id: &TokenId) -> Decimal {
+    /// Get the position qty for a token+wallet (0 if no position).
+    pub fn position_qty(&self, token_id: &TokenId, wallet: &WalletAddr) -> Decimal {
+        let key = make_position_key(token_id, wallet);
         self.positions
-            .get(token_id)
+            .get(&key)
             .map(|p| p.qty)
             .unwrap_or(Decimal::ZERO)
     }
@@ -183,7 +199,8 @@ impl Portfolio {
         marking_mode: MarkingMode,
     ) -> Decimal {
         let mut total = Decimal::ZERO;
-        for (token_id, pos) in &self.positions {
+        for (_key, pos) in &self.positions {
+            let token_id = &pos.token_id;
             let mark_price = match books.get(token_id) {
                 Some(book) => match marking_mode {
                     MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
@@ -210,7 +227,8 @@ impl Portfolio {
         fee_store: Option<&crate::storage::db::Store>,
     ) -> Decimal {
         let mut total = Decimal::ZERO;
-        for (token_id, pos) in &self.positions {
+        for (_key, pos) in &self.positions {
+            let token_id = &pos.token_id;
             let mark_price = match books.get(token_id) {
                 Some(book) => match marking_mode {
                     MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
@@ -253,7 +271,8 @@ impl Portfolio {
         marking_mode: MarkingMode,
     ) -> HashMap<WalletAddr, Decimal> {
         let mut by_wallet: HashMap<WalletAddr, Decimal> = HashMap::new();
-        for (token_id, pos) in &self.positions {
+        for (_key, pos) in &self.positions {
+            let token_id = &pos.token_id;
             let mark_price = match books.get(token_id) {
                 Some(book) => match marking_mode {
                     MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
@@ -278,7 +297,8 @@ impl Portfolio {
         marking_mode: MarkingMode,
     ) -> HashMap<WalletAddr, Decimal> {
         let mut by_wallet: HashMap<WalletAddr, Decimal> = HashMap::new();
-        for (token_id, pos) in &self.positions {
+        for (_key, pos) in &self.positions {
+            let token_id = &pos.token_id;
             let mark_price = match books.get(token_id) {
                 Some(book) => match marking_mode {
                     MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
@@ -301,7 +321,8 @@ impl Portfolio {
         marking_mode: MarkingMode,
     ) -> Decimal {
         let mut total = Decimal::ZERO;
-        for (token_id, pos) in &self.positions {
+        for (_key, pos) in &self.positions {
+            let token_id = &pos.token_id;
             let mark_price = match books.get(token_id) {
                 Some(book) => match marking_mode {
                     MarkingMode::Conservative => book.best_bid().unwrap_or(Decimal::ZERO),
@@ -441,8 +462,8 @@ mod tests {
 
         assert_eq!(p.cash, dec!(10000) - dec!(50) - dec!(0.03));
         assert_eq!(p.positions.len(), 1);
-        assert_eq!(p.positions["t1"].qty, dec!(100));
-        assert_eq!(p.positions["t1"].avg_entry_price, dec!(0.500000));
+        assert_eq!(p.positions[&make_position_key("t1", "0xw")].qty, dec!(100));
+        assert_eq!(p.positions[&make_position_key("t1", "0xw")].avg_entry_price, dec!(0.500000));
         assert_eq!(p.realized_fees, dec!(0.03));
         assert_eq!(p.turnover, dec!(50));
     }
@@ -455,7 +476,7 @@ mod tests {
             .unwrap();
 
         let sell_fill = make_fill(Side::Sell, dec!(100), dec!(0.60), dec!(0.02));
-        p.apply_sell(&"t1".into(), &sell_fill).unwrap();
+        p.apply_sell(&"t1".into(), &"0xw".into(), &sell_fill).unwrap();
 
         // Position should be closed
         assert!(p.positions.is_empty());
@@ -474,9 +495,9 @@ mod tests {
             .unwrap();
 
         let sell_fill = make_fill(Side::Sell, dec!(40), dec!(0.60), dec!(0.01));
-        p.apply_sell(&"t1".into(), &sell_fill).unwrap();
+        p.apply_sell(&"t1".into(), &"0xw".into(), &sell_fill).unwrap();
 
-        assert_eq!(p.positions["t1"].qty, dec!(60));
+        assert_eq!(p.positions[&make_position_key("t1", "0xw")].qty, dec!(60));
         // Cost basis of 40 shares at 0.50 = 20, gross pnl = 24 - 20 = 4
         assert_eq!(p.realized_pnl_gross, dec!(4));
     }
@@ -485,7 +506,7 @@ mod tests {
     fn sell_without_position_errors() {
         let mut p = Portfolio::new(dec!(10000));
         let sell_fill = make_fill(Side::Sell, dec!(100), dec!(0.60), dec!(0.02));
-        let err = p.apply_sell(&"t1".into(), &sell_fill).unwrap_err();
+        let err = p.apply_sell(&"t1".into(), &"0xw".into(), &sell_fill).unwrap_err();
         assert!(err.to_string().contains("non-existent"));
     }
 
@@ -497,7 +518,7 @@ mod tests {
             .unwrap();
 
         let sell_fill = make_fill(Side::Sell, dec!(100), dec!(0.60), dec!(0));
-        let err = p.apply_sell(&"t1".into(), &sell_fill).unwrap_err();
+        let err = p.apply_sell(&"t1".into(), &"0xw".into(), &sell_fill).unwrap_err();
         assert!(err.to_string().contains("exceeds"));
     }
 
@@ -563,7 +584,7 @@ mod tests {
         let p2 = Portfolio::from_json(&json).unwrap();
         assert_eq!(p2.cash, p.cash);
         assert_eq!(p2.positions.len(), 1);
-        assert_eq!(p2.positions["t1"].qty, dec!(100));
+        assert_eq!(p2.positions[&make_position_key("t1", "0xw")].qty, dec!(100));
     }
 
     #[test]
@@ -577,7 +598,7 @@ mod tests {
         p.apply_buy(&"t1".into(), "m1", &fill2, &"0xw".into(), WalletCategory::Directional)
             .unwrap();
 
-        let pos = &p.positions["t1"];
+        let pos = &p.positions[&make_position_key("t1", "0xw")];
         assert_eq!(pos.qty, dec!(200));
         // cost = 50 + 60 = 110, avg = 110/200 = 0.55
         assert_eq!(pos.avg_entry_price, dec!(0.550000));

@@ -24,6 +24,7 @@ const RESET: &str = "\x1b[0m";
 const HEADER_LINES: u16 = 7;
 
 /// Shared state for the TUI — updated by the engine, read by the renderer.
+#[allow(dead_code)]
 pub struct TuiState {
     pub initialized: bool,
     pub trade_feed: Vec<String>,
@@ -31,6 +32,7 @@ pub struct TuiState {
 }
 
 impl TuiState {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             initialized: false,
