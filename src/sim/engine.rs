@@ -56,6 +56,20 @@ pub struct EngineState {
     pub wallet_pnl_history: HashMap<WalletAddr, Vec<Decimal>>,
     /// Time-series PnL snapshots for the report chart. Recorded every 30s.
     pub pnl_timeline: Vec<PnlSnapshot>,
+    /// Tokens that returned 404 on book fetch — don't retry (market closed/resolved).
+    dead_tokens: HashSet<TokenId>,
+    /// Per-wallet realized PnL + fees tracking for individual wallet attribution.
+    pub wallet_realized: HashMap<WalletAddr, WalletRealizedStats>,
+}
+
+/// Per-wallet realized PnL tracking. Updated on every fill.
+#[derive(Debug, Clone, Default)]
+pub struct WalletRealizedStats {
+    pub realized_pnl_gross: Decimal,
+    pub realized_fees: Decimal,
+    pub fills: u64,
+    pub misses: u64,
+    pub volume: Decimal,
 }
 
 /// A point-in-time snapshot of portfolio PnL for time series display.
@@ -254,6 +268,8 @@ pub async fn run_session(
         trade_time_hits: 0,
         wallet_pnl_history: HashMap::new(),
         pnl_timeline: Vec::new(),
+        dead_tokens: HashSet::new(),
+        wallet_realized: HashMap::new(),
     };
 
     // Shutdown signal
@@ -644,33 +660,34 @@ async fn handle_wallet_trade(
     // We do NOT fetch a new book after the tracked wallet traded — that would
     // be hindsight. If the book is missing/stale, we do a REST warmup, but this
     // represents what we would realistically see, not a post-trade book.
-    let book_needs_warmup = match state.books.get(&trade.token_id) {
-        None => true,
-        Some(b) => b.quality == DataQuality::Rebuilding || b.quality == DataQuality::Stale,
-    };
+    // Skip tokens that already 404'd (closed/resolved markets) — no point retrying.
+    if !state.dead_tokens.contains(&trade.token_id) {
+        let book_needs_warmup = match state.books.get(&trade.token_id) {
+            None => true,
+            Some(b) => b.quality == DataQuality::Rebuilding || b.quality == DataQuality::Stale,
+        };
 
-    if book_needs_warmup {
-        debug!(
-            token = %trade.token_id,
-            is_first = is_first_trade,
-            "attempting REST book warmup for trade"
-        );
-        match rest_book::fetch_book(http_client, &trade.token_id).await {
-            Ok(snapshot) => {
-                let book = state
-                    .books
-                    .entry(trade.token_id.clone())
-                    .or_insert_with(|| OrderBook::new(trade.token_id.clone()));
-                book.apply_snapshot(&snapshot.bids, &snapshot.asks);
-                state.warmed_tokens.insert(trade.token_id.clone());
-                state.book_warmups += 1;
-            }
-            Err(e) => {
-                warn!(
-                    token = %trade.token_id,
-                    error = %e,
-                    "REST book warmup failed"
-                );
+        if book_needs_warmup {
+            match rest_book::fetch_book(http_client, &trade.token_id).await {
+                Ok(snapshot) => {
+                    let book = state
+                        .books
+                        .entry(trade.token_id.clone())
+                        .or_insert_with(|| OrderBook::new(trade.token_id.clone()));
+                    book.apply_snapshot(&snapshot.bids, &snapshot.asks);
+                    state.warmed_tokens.insert(trade.token_id.clone());
+                    state.book_warmups += 1;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("404") || err_str.contains("No orderbook") {
+                        // Market is dead — never retry
+                        state.dead_tokens.insert(trade.token_id.clone());
+                        debug!(token = %trade.token_id, "token marked dead (404/no orderbook)");
+                    } else {
+                        debug!(token = %trade.token_id, error = %e, "REST book warmup failed");
+                    }
+                }
             }
         }
     }
@@ -872,39 +889,54 @@ async fn handle_wallet_trade(
         }
     }
 
-    // Track realized PnL/fees delta per category
+    // Track realized PnL/fees delta per category AND per wallet
     let pnl_delta = state.portfolio.realized_pnl_gross - pnl_before;
     let fees_delta = state.portfolio.realized_fees - fees_before;
-    // Re-borrow cat_stats (was dropped by match above)
+
     let cat_stats = state.category_stats.entry(trade.category).or_default();
     cat_stats.realized_pnl_gross += pnl_delta;
     cat_stats.realized_fees += fees_delta;
 
-    // === LIVE TRADE FEED ===
-    let wallet_name = state.wallet_names.get(&trade.wallet)
-        .cloned()
-        .unwrap_or_else(|| abbreviate_addr(&trade.wallet));
-    let market_name = store.lookup_token_market(&trade.token_id)
-        .map(|(q, outcome)| {
-            let short_q = if q.len() > 40 { format!("{}...", &q[..40]) } else { q };
-            format!("{short_q} ({outcome})")
-        })
-        .unwrap_or_else(|| {
-            if trade.token_id.len() > 16 { format!("{}...", &trade.token_id[..16]) }
-            else { trade.token_id.clone() }
-        });
+    let ws = state.wallet_realized.entry(trade.wallet.clone()).or_default();
+    ws.realized_pnl_gross += pnl_delta;
+    ws.realized_fees += fees_delta;
+    ws.volume += output.cost;
+    match &output.result {
+        FillResult::Full | FillResult::Partial { .. } => ws.fills += 1,
+        FillResult::Miss { .. } => ws.misses += 1,
+    }
 
-    let line = tui::format_trade_line(
-        &output.result,
-        trade.side,
-        &wallet_name,
-        &market_name,
-        output.avg_price,
-        output.filled_qty,
-        output.fee_amount,
-        detection_delay_ms,
-    );
-    println!("{line}");
+    // === LIVE TRADE FEED ===
+    // Suppress output for dead-token misses (closed markets) — they're noise.
+    let is_dead_token_miss = state.dead_tokens.contains(&trade.token_id)
+        && matches!(&output.result, FillResult::Miss { .. });
+
+    if !is_dead_token_miss {
+        let wallet_name = state.wallet_names.get(&trade.wallet)
+            .cloned()
+            .unwrap_or_else(|| abbreviate_addr(&trade.wallet));
+        let market_name = store.lookup_token_market(&trade.token_id)
+            .map(|(q, outcome)| {
+                let short_q = if q.len() > 40 { format!("{}...", &q[..40]) } else { q };
+                format!("{short_q} ({outcome})")
+            })
+            .unwrap_or_else(|| {
+                if trade.token_id.len() > 16 { format!("{}...", &trade.token_id[..16]) }
+                else { trade.token_id.clone() }
+            });
+
+        let line = tui::format_trade_line(
+            &output.result,
+            trade.side,
+            &wallet_name,
+            &market_name,
+            output.avg_price,
+            output.filled_qty,
+            output.fee_amount,
+            detection_delay_ms,
+        );
+        println!("{line}");
+    }
 
     // Log the simulated fill event
     let fill_event = NormalizedEvent::SimulatedFill {
@@ -1151,58 +1183,91 @@ fn print_wallet_leaderboard(state: &mut EngineState) {
     let unrealized_map = state.portfolio.unrealized_by_wallet(&state.books, mode);
     let exposure_map = state.portfolio.exposure_by_wallet(&state.books, mode);
 
-    if unrealized_map.is_empty() {
-        return;
-    }
-
-    // Record current snapshot in history and compute trend
+    // Record PnL history for trend arrows
     for (wallet, pnl) in &unrealized_map {
         let history = state.wallet_pnl_history.entry(wallet.clone()).or_default();
         history.push(*pnl);
-        // Keep last 12 snapshots (= 1 hour at 5-min intervals)
-        if history.len() > 12 {
-            history.remove(0);
-        }
+        if history.len() > 12 { history.remove(0); }
     }
 
-    let mut sorted: Vec<_> = unrealized_map.iter().collect();
-    sorted.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Build total PnL per wallet (realized + unrealized)
+    struct WalletLine {
+        addr: String,
+        name: String,
+        total_pnl: Decimal,
+        realized: Decimal,
+        unrealized: Decimal,
+        fills: u64,
+        misses: u64,
+        exposure: Decimal,
+        is_dir: bool,
+    }
 
-    let show = sorted.len().min(6);
+    let mut lines: Vec<WalletLine> = Vec::new();
+    // Collect all wallets that have any activity
+    let mut all_wallets: HashSet<String> = HashSet::new();
+    for w in state.wallet_realized.keys() { all_wallets.insert(w.clone()); }
+    for w in unrealized_map.keys() { all_wallets.insert(w.clone()); }
+
+    for addr in &all_wallets {
+        let ws = state.wallet_realized.get(addr);
+        let realized_net = ws.map(|w| w.realized_pnl_gross - w.realized_fees).unwrap_or(Decimal::ZERO);
+        let unrealized = unrealized_map.get(addr).copied().unwrap_or(Decimal::ZERO);
+        let exposure = exposure_map.get(addr).copied().unwrap_or(Decimal::ZERO);
+        let fills = ws.map(|w| w.fills).unwrap_or(0);
+        let misses = ws.map(|w| w.misses).unwrap_or(0);
+        let name = state.wallet_names.get(addr)
+            .cloned()
+            .unwrap_or_else(|| abbreviate_addr(addr));
+        // Determine category from position data or wallet name prefix
+        let is_dir = name.starts_with("dir");
+
+        lines.push(WalletLine {
+            addr: addr.clone(), name, total_pnl: realized_net + unrealized,
+            realized: realized_net, unrealized, fills, misses, exposure, is_dir,
+        });
+    }
+
+    if lines.is_empty() { return; }
+
+    // Split by category
+    let mut dir_lines: Vec<&WalletLine> = lines.iter().filter(|l| l.is_dir).collect();
+    let mut arb_lines: Vec<&WalletLine> = lines.iter().filter(|l| !l.is_dir).collect();
+    dir_lines.sort_by(|a, b| b.total_pnl.partial_cmp(&a.total_pnl).unwrap_or(std::cmp::Ordering::Equal));
+    arb_lines.sort_by(|a, b| b.total_pnl.partial_cmp(&a.total_pnl).unwrap_or(std::cmp::Ordering::Equal));
+
+    let print_section = |label: &str, color: &str, wallets: &[&WalletLine]| {
+        if wallets.is_empty() { return; }
+        let show = wallets.len().min(5);
+        println!("  {DIM}│{RESET} {color}{BOLD}{label}{RESET} {DIM}({} wallets){RESET}", wallets.len());
+        for w in &wallets[..show] {
+            let trend = state.wallet_pnl_history.get(&w.addr)
+                .and_then(|h| if h.len() >= 2 {
+                    if h[h.len()-1] > h[h.len()-2] { Some(format!("{GREEN}^{RESET}")) }
+                    else if h[h.len()-1] < h[h.len()-2] { Some(format!("{RED}v{RESET}")) }
+                    else { Some(format!("{DIM}={RESET}")) }
+                } else { None })
+                .unwrap_or_else(|| " ".into());
+            println!("  {DIM}│{RESET}   {:<10} {} {:>12}  {DIM}real={} unreal={} {}f/{}m exp=${:.0}{RESET}",
+                w.name, trend, color_pnl(w.total_pnl),
+                color_pnl(w.realized), color_pnl(w.unrealized),
+                w.fills, w.misses, w.exposure);
+        }
+        if wallets.len() > show {
+            let worst = wallets.last().unwrap();
+            println!("  {DIM}│   ... {} more{RESET}", wallets.len() - show);
+            println!("  {DIM}│{RESET}   {:<10}   {:>12}  {DIM}{}f/{}m{RESET}",
+                worst.name, color_pnl(worst.total_pnl), worst.fills, worst.misses);
+        }
+    };
 
     println!();
-    println!("  {DIM}┌─{RESET} {BOLD}Wallet Snapshot{RESET} {DIM}(unrealized PnL, trend, exposure){RESET}");
-
-    for (wallet, pnl) in &sorted[..show] {
-        let name = state.wallet_names.get(*wallet)
-            .cloned()
-            .unwrap_or_else(|| abbreviate_addr(wallet));
-        let exp = exposure_map.get(*wallet).copied().unwrap_or(Decimal::ZERO);
-
-        // Trend: compare to previous snapshot
-        let trend = state.wallet_pnl_history.get(*wallet)
-            .and_then(|h| if h.len() >= 2 {
-                let prev = h[h.len() - 2];
-                let curr = h[h.len() - 1];
-                if curr > prev { Some(format!("{GREEN}{RESET}")) }
-                else if curr < prev { Some(format!("{RED}{RESET}")) }
-                else { Some(format!("{DIM}={RESET}")) }
-            } else { None })
-            .unwrap_or_default();
-
-        println!("  {DIM}│{RESET}  {:<12} {:>14} {trend}  {DIM}exp=${:.0}{RESET}", name, color_pnl(**pnl), exp);
+    println!("  {DIM}┌─{RESET} {BOLD}Wallet Leaderboard{RESET} {DIM}(total PnL = realized + unrealized){RESET}");
+    print_section("directional", CYAN, &dir_lines);
+    if !dir_lines.is_empty() && !arb_lines.is_empty() {
+        println!("  {DIM}│{RESET}");
     }
-
-    if sorted.len() > show {
-        let (worst_addr, worst_pnl) = sorted.last().unwrap();
-        let worst_name = state.wallet_names.get(*worst_addr)
-            .cloned()
-            .unwrap_or_else(|| abbreviate_addr(worst_addr));
-        let worst_exp = exposure_map.get(*worst_addr).copied().unwrap_or(Decimal::ZERO);
-        println!("  {DIM}│  ...  ({} more wallets){RESET}", sorted.len() - show);
-        println!("  {DIM}│{RESET}  {:<12} {:>14}    {DIM}exp=${:.0}{RESET}", worst_name, color_pnl(**worst_pnl), worst_exp);
-    }
-
+    print_section("arbitrage", YELLOW, &arb_lines);
     println!("  {DIM}└─{RESET}");
     println!();
 }

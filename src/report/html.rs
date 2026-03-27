@@ -262,62 +262,81 @@ Realized PnL is negative ({realized}). The positive net figure includes unrealiz
         let _ = write!(html, "</div>");
     }
 
-    // === WALLET LEADERBOARD ===
+    // === WALLET LEADERBOARD (split by category) ===
     if !a.wallet_stats.is_empty() {
-        let mut sorted_wallets = a.wallet_stats.clone();
-        sorted_wallets.sort_by(|a, b| b.realized_pnl.cmp(&a.realized_pnl));
+        let render_wallet_table = |html: &mut String, label: &str, tag: &str, wallets: &[&crate::report::analytics::WalletStats]| {
+            if wallets.is_empty() { return; }
 
-        let _ = write!(
-            html,
-            r#"<h2>Wallet Leaderboard</h2>
+            let _ = write!(html,
+                r#"<h3><span class="tag {tag}">{label}</span> — {count} wallets</h3>
 <table>
-<tr><th>Wallet</th><th>Category</th><th>Fill Rate</th><th>Fills/Misses</th><th class="right">Volume</th><th class="right">Fees</th><th class="right">Realized</th><th class="right">Unrealized</th><th class="right">Exposure</th></tr>"#
-        );
-        for (idx, w) in sorted_wallets.iter().enumerate() {
-            let row_class = if idx < 3 { r#" class="top-row""# } else { "" };
-            let cat_tag = match w.category {
-                crate::core::types::WalletCategory::Directional => "tag-dir",
-                crate::core::types::WalletCategory::Arbitrage => "tag-arb",
-            };
-            // Wallet name with optional profile link
-            let name_html = match &w.profile_url {
-                Some(url) => format!(
-                    r#"<a href="{}" style="color:var(--blue);text-decoration:none" target="_blank">{}</a>"#,
-                    html_escape(url),
-                    html_escape(&w.display_name),
-                ),
-                None => html_escape(&w.display_name),
-            };
-            let _ = write!(
-                html,
-                r#"<tr{row_class}>
-<td class="mono" title="{full}">{name_html}</td>
-<td><span class="tag {cat_tag}">{cat}</span></td>
-<td>{fill_rate}%</td>
-<td>{fills}/{misses}</td>
-<td class="right">${vol:.2}</td>
-<td class="right">${fees:.4}</td>
-<td class="right {pc}">{pnl}</td>
-<td class="right {uc}">{unrealized}</td>
-<td class="right">${exposure:.2}</td>
-</tr>"#,
-                full = w.wallet,
-                name_html = name_html,
-                cat_tag = cat_tag,
-                cat = w.category,
-                fill_rate = w.fill_rate_pct,
-                fills = w.fill_count,
-                misses = w.miss_count,
-                vol = w.volume,
-                fees = w.fees_paid,
-                pc = pnl_class(w.realized_pnl),
-                pnl = fmt_pnl(w.realized_pnl),
-                uc = pnl_class(w.unrealized_pnl),
-                unrealized = fmt_pnl(w.unrealized_pnl),
-                exposure = w.open_exposure,
+<tr><th>Wallet</th><th>Fill</th><th>Fills/Miss</th><th class="right">Total PnL</th><th class="right">Realized</th><th class="right">Unrealized</th><th class="right">Fees</th><th class="right">Volume</th><th class="right">Exposure</th></tr>"#,
+                tag = tag, label = label, count = wallets.len(),
             );
-        }
-        let _ = write!(html, "</table>");
+
+            for (idx, w) in wallets.iter().enumerate() {
+                let total_pnl = w.realized_pnl + w.unrealized_pnl;
+                let row_class = if idx < 3 { r#" class="top-row""# } else { "" };
+                let name_html = match &w.profile_url {
+                    Some(url) => format!(
+                        r#"<a href="{}" style="color:var(--blue);text-decoration:none" target="_blank">{}</a>"#,
+                        html_escape(url), html_escape(&w.display_name)),
+                    None => html_escape(&w.display_name),
+                };
+                let _ = write!(html,
+                    r#"<tr{row_class}>
+<td class="mono" title="{full}">{name}</td>
+<td>{fr}%</td>
+<td>{f}/{m}</td>
+<td class="right {tc}"><strong>{total}</strong></td>
+<td class="right {rc}">{real}</td>
+<td class="right {uc}">{unreal}</td>
+<td class="right">${fees:.2}</td>
+<td class="right">${vol:.0}</td>
+<td class="right">${exp:.0}</td>
+</tr>"#,
+                    row_class = row_class,
+                    full = w.wallet,
+                    name = name_html,
+                    fr = w.fill_rate_pct,
+                    f = w.fill_count,
+                    m = w.miss_count,
+                    tc = pnl_class(total_pnl),
+                    total = fmt_pnl(total_pnl),
+                    rc = pnl_class(w.realized_pnl),
+                    real = fmt_pnl(w.realized_pnl),
+                    uc = pnl_class(w.unrealized_pnl),
+                    unreal = fmt_pnl(w.unrealized_pnl),
+                    fees = w.fees_paid,
+                    vol = w.volume,
+                    exp = w.open_exposure,
+                );
+            }
+            let _ = write!(html, "</table>");
+        };
+
+        // Split and sort by total PnL within each category
+        let mut dir_wallets: Vec<&_> = a.wallet_stats.iter()
+            .filter(|w| w.category == crate::core::types::WalletCategory::Directional)
+            .collect();
+        let mut arb_wallets: Vec<&_> = a.wallet_stats.iter()
+            .filter(|w| w.category == crate::core::types::WalletCategory::Arbitrage)
+            .collect();
+
+        dir_wallets.sort_by(|a, b| {
+            let a_total = a.realized_pnl + a.unrealized_pnl;
+            let b_total = b.realized_pnl + b.unrealized_pnl;
+            b_total.partial_cmp(&a_total).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        arb_wallets.sort_by(|a, b| {
+            let a_total = a.realized_pnl + a.unrealized_pnl;
+            let b_total = b.realized_pnl + b.unrealized_pnl;
+            b_total.partial_cmp(&a_total).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let _ = write!(html, r#"<h2>Wallet Leaderboard</h2>"#);
+        render_wallet_table(&mut html, "directional", "tag-dir", &dir_wallets);
+        render_wallet_table(&mut html, "arbitrage", "tag-arb", &arb_wallets);
     }
 
     // === PnL EVOLUTION CHART (SVG) ===

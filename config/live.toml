@@ -35,7 +35,7 @@ sessions_dir = "sessions"
 mark_interval_secs = 5
 
 [category.directional]
-max_slippage_bps = "2000"
+max_slippage_bps = "10000"
 
 [category.arbitrage]
 max_slippage_bps = "200"

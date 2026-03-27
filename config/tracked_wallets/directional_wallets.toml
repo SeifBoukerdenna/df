@@ -100,3 +100,23 @@ name = "dir-24"
 [[wallet]]
 address = "0xc6b6ffce6c52b6fdf4bad57de303939f19ab13ac"
 name = "dir-25"
+
+[[wallet]]
+address = "0x07921379f7b31ef93da634b688b2fe36897db778"
+name = "dir-26"
+
+[[wallet]]
+address = "0xa80e3fe5e7a445fa047fe6de1e27f9a15217b94b"
+name = "dir-27"
+
+[[wallet]]
+address = "0x6297b93ea37ff92a57fd636410f3b71ebf74517e"
+name = "dir-28"
+
+[[wallet]]
+address = "0xb7f55b6d32c2ee3768192d676cd66354f51fc669"
+name = "dir-29"
+
+[[wallet]]
+address = "0x1f66796b45581868376365aef54b51eb84184c8d"
+name = "dir-29"

@@ -41,3 +41,15 @@ name = "arb-09"
 [[wallet]]
 address = "0x70ec235a31eb35f243e2618d6ea3b5b8962bbb5d"
 name = "arb-10"
+
+[[wallet]]
+address = "0x5b87d38577b2811179b7aa8f2cddc65d7046b6bd"
+name = "arb-11"
+
+[[wallet]]
+address = "0x7f3c8979d0afa00007bae4747d5347122af05613"
+name = "arb-12"
+
+[[wallet]]
+address = "0xe00740bce98a594e26861838885ab310ec3b548c"
+name = "arb-13"
